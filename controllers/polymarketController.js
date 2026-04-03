@@ -935,8 +935,115 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
 const getMarketById = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  const response_data = await gammaApi.get(`/markets/${id}`);
-  const transformed = transformMarket(response_data.data);
+  const tryFetchGammaById = async (candidateId) => {
+    if (!candidateId) return null;
+    try {
+      const gammaResponse = await gammaApi.get(`/markets/${candidateId}`);
+      const marketData = Array.isArray(gammaResponse.data)
+        ? gammaResponse.data[0]
+        : gammaResponse.data;
+      return marketData && (marketData.id || marketData.question)
+        ? marketData
+        : null;
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  let gammaMarket = await tryFetchGammaById(id);
+
+  // If the route parameter is a local Mongo _id, resolve to external Gamma id first.
+  if (!gammaMarket) {
+    try {
+      const slugResponse = await gammaApi.get("/markets", {
+        params: {
+          slug: id,
+          limit: 1,
+          closed: true,
+        },
+      });
+      const slugMarkets = Array.isArray(slugResponse.data)
+        ? slugResponse.data
+        : slugResponse.data?.data || slugResponse.data?.markets || [];
+      gammaMarket = slugMarkets[0] || null;
+    } catch (_error) {
+      // Ignore slug lookup errors and continue with local fallback.
+    }
+
+    if (gammaMarket) {
+      const transformed = transformMarket(gammaMarket);
+      const [enriched] = await attachLocalOutcomeStats([transformed]);
+      return response.success(res, enriched || transformed);
+    }
+
+    let localMarket = null;
+    try {
+      localMarket = await Market.findById(id)
+        .select(
+          "externalId conditionId outcomeStates question totalVolume endDate imageUrl tags",
+        )
+        .lean();
+    } catch (_error) {
+      localMarket = await Market.findOne({
+        $or: [{ externalId: id }, { conditionId: id }],
+      })
+        .select(
+          "externalId conditionId outcomeStates question totalVolume endDate imageUrl tags",
+        )
+        .lean();
+    }
+
+    const candidateIds = [
+      localMarket?.externalId,
+      localMarket?.conditionId,
+      id,
+    ].filter(Boolean);
+
+    for (const candidate of candidateIds) {
+      gammaMarket = await tryFetchGammaById(candidate);
+      if (gammaMarket) break;
+    }
+
+    // Last resort: use local data shape so clients still receive available outcomes.
+    if (!gammaMarket && localMarket) {
+      const localFallback = {
+        _id: id,
+        question: localMarket.question || "Market",
+        description: "",
+        category: "World",
+        endDate: localMarket.endDate,
+        yesPrice: 0.5,
+        noPrice: 0.5,
+        outcomes: (localMarket.outcomeStates || []).map((state, index) => ({
+          key: state.key,
+          label: state.label,
+          price: 0.5,
+          probability: 0.5,
+          volume: 0,
+          recentTrades: 0,
+          order: Number(state.order ?? index),
+        })),
+        priceChange24h: 0,
+        totalVolume: Number(localMarket.totalVolume || 0),
+        liquidity: 0,
+        imageUrl: localMarket.imageUrl || null,
+        slug: null,
+        conditionId: localMarket.conditionId || null,
+        resolved: false,
+        outcome: null,
+        tags: localMarket.tags || [],
+      };
+
+      const [enrichedLocal] = await attachLocalOutcomeStats([localFallback]);
+      return response.success(res, enrichedLocal || localFallback);
+    }
+  }
+
+  if (!gammaMarket) {
+    return response.notFound(res, "Market");
+  }
+
+  const transformed = transformMarket(gammaMarket);
   const [enriched] = await attachLocalOutcomeStats([transformed]);
 
   return response.success(res, enriched || transformed);
