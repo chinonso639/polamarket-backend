@@ -540,21 +540,35 @@ const buildGroupedContracts = (eventPayload, currentMarketId) => {
     return [];
   }
 
-  return eventMarkets
-    .map((item) => transformMarket(item))
-    .map((item) => ({
-      id: String(item._id),
-      slug: item.slug || null,
-      label: item.groupItemTitle || item.question,
-      question: item.question,
-      yesPrice: Number(item.yesPrice || 0.5),
-      noPrice: Number(item.noPrice || 0.5),
-      totalVolume: Number(item.totalVolume || 0),
-      resolved: Boolean(item.resolved),
-      isCurrent: String(item._id) === String(currentMarketId),
-      endDate: item.endDate || null,
-    }))
-    .sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0));
+  return (
+    eventMarkets
+      .map((item) => transformMarket(item))
+      .map((item) => ({
+        id: String(item._id),
+        slug: item.slug || null,
+        label: item.groupItemTitle || item.question,
+        question: item.question,
+        yesPrice: Number(item.yesPrice || 0.5),
+        noPrice: Number(item.noPrice || 0.5),
+        totalVolume: Number(item.totalVolume || 0),
+        resolved: Boolean(item.resolved),
+        isCurrent: String(item._id) === String(currentMarketId),
+        endDate: item.endDate || null,
+      }))
+      // Filter out placeholder contracts (zero volume with 50% price or placeholder names)
+      .filter((item) => {
+        const isPlaceholderPrice =
+          item.yesPrice === 0.5 && item.noPrice === 0.5;
+        const isPlaceholderName =
+          /^(Team\s+[A-Z]{1,2}|Other|Person\s+[A-Z])$/i.test(item.label);
+        const hasNoVolume = item.totalVolume === 0;
+        // Keep if it has volume, or if it doesn't look like a placeholder
+        return (
+          item.totalVolume > 0 || (!isPlaceholderPrice && !isPlaceholderName)
+        );
+      })
+      .sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0))
+  );
 };
 
 const deriveEventSlugFromMarket = (market = {}) => {
@@ -918,14 +932,13 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
       ? eventsResponse.data
       : eventsResponse.data.events || [];
 
-    // Extract markets from events
+    // Extract all active markets from events
     for (const event of events) {
       const eventMarkets = Array.isArray(event.markets) ? event.markets : [];
-      // Only take top markets per event to avoid flooding with one topic
-      const topEventMarkets = eventMarkets
-        .filter((m) => !m.closed && m.active !== false)
-        .slice(0, 3);
-      allMarkets = [...allMarkets, ...topEventMarkets];
+      const activeEventMarkets = eventMarkets.filter(
+        (m) => !m.closed && m.active !== false,
+      );
+      allMarkets = [...allMarkets, ...activeEventMarkets];
     }
   } catch (error) {
     logger.warn(`Failed to fetch events: ${error.message}`);
@@ -1148,6 +1161,7 @@ const getMarketById = asyncHandler(async (req, res) => {
     }
   }
 
+  // Fallback 1: Try deriving event slug from market slug (for -NNNN-NNNN or -NNNN+ patterns)
   if (
     !Array.isArray(transformed.groupContracts) ||
     transformed.groupContracts.length <= 1
@@ -1178,6 +1192,47 @@ const getMarketById = asyncHandler(async (req, res) => {
       } catch (_error) {
         // Non-fatal fallback; market detail still returns without grouped contracts.
       }
+    }
+  }
+
+  // Fallback 2: If groupItemTitle is set, search top events to find parent event
+  if (
+    (!Array.isArray(transformed.groupContracts) ||
+      transformed.groupContracts.length <= 1) &&
+    transformed.groupItemTitle
+  ) {
+    try {
+      const eventsResponse = await gammaApi.get("/events", {
+        params: {
+          limit: 100,
+          order: "volume",
+          ascending: false,
+          active: true,
+        },
+      });
+      const events = Array.isArray(eventsResponse.data)
+        ? eventsResponse.data
+        : eventsResponse.data?.events || [];
+
+      // Find the event containing this market
+      const parentEvent = events.find(
+        (ev) =>
+          Array.isArray(ev.markets) &&
+          ev.markets.some((m) => String(m.id) === String(transformed._id)),
+      );
+
+      if (parentEvent) {
+        const groupedContracts = buildGroupedContracts(
+          parentEvent,
+          transformed._id,
+        );
+        if (groupedContracts.length > 0) {
+          transformed.groupContracts = groupedContracts;
+          transformed.eventId = transformed.eventId || parentEvent.id || null;
+        }
+      }
+    } catch (_error) {
+      // Non-fatal fallback
     }
   }
 
