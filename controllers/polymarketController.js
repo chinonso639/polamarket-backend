@@ -521,11 +521,54 @@ const transformMarket = (market) => {
     liquidity: parseFloat(market.liquidity || market.liquidityNum || 0),
     imageUrl: market.image || market.icon || null,
     slug: market.slug || market.market_slug,
+    groupItemTitle: market.groupItemTitle || null,
+    eventId:
+      market.eventId || market.events?.[0]?.id || market.event?.id || null,
     conditionId: market.conditionId || market.condition_id,
     resolved: market.closed || market.resolved || false,
     outcome: market.outcome || null,
     tags: market.tags || [],
   };
+};
+
+const buildGroupedContracts = (eventPayload, currentMarketId) => {
+  const eventMarkets = Array.isArray(eventPayload?.markets)
+    ? eventPayload.markets
+    : [];
+
+  if (eventMarkets.length <= 1) {
+    return [];
+  }
+
+  return eventMarkets
+    .map((item) => transformMarket(item))
+    .map((item) => ({
+      id: String(item._id),
+      slug: item.slug || null,
+      label: item.groupItemTitle || item.question,
+      question: item.question,
+      yesPrice: Number(item.yesPrice || 0.5),
+      noPrice: Number(item.noPrice || 0.5),
+      totalVolume: Number(item.totalVolume || 0),
+      resolved: Boolean(item.resolved),
+      isCurrent: String(item._id) === String(currentMarketId),
+      endDate: item.endDate || null,
+    }))
+    .sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0));
+};
+
+const deriveEventSlugFromMarket = (market = {}) => {
+  const explicitEventSlug =
+    market.eventSlug || market.events?.[0]?.slug || market.event?.slug;
+  if (explicitEventSlug) return String(explicitEventSlug);
+
+  const slug = String(market.slug || market.market_slug || "").trim();
+  if (!slug) return null;
+
+  // Handles grouped binary contracts like:
+  // elon-musk-of-tweets-april-2026-1600-1679 -> elon-musk-of-tweets-april-2026
+  const withoutRange = slug.replace(/-(\d+)(-(\d+)|\+)$/i, "");
+  return withoutRange !== slug ? withoutRange : null;
 };
 
 const SPORTS_KEYWORDS = [
@@ -1044,6 +1087,60 @@ const getMarketById = asyncHandler(async (req, res) => {
   }
 
   const transformed = transformMarket(gammaMarket);
+
+  if (transformed.eventId) {
+    try {
+      const eventResponse = await gammaApi.get(
+        `/events/${transformed.eventId}`,
+      );
+      const eventPayload = Array.isArray(eventResponse.data)
+        ? eventResponse.data[0]
+        : eventResponse.data;
+      const groupedContracts = buildGroupedContracts(
+        eventPayload,
+        transformed._id,
+      );
+      if (groupedContracts.length > 0) {
+        transformed.groupContracts = groupedContracts;
+      }
+    } catch (_error) {
+      // Non-fatal. Some events may not expose grouped markets.
+    }
+  }
+
+  if (
+    !Array.isArray(transformed.groupContracts) ||
+    transformed.groupContracts.length <= 1
+  ) {
+    const derivedEventSlug = deriveEventSlugFromMarket(gammaMarket);
+    if (derivedEventSlug) {
+      try {
+        const eventLookupResponse = await gammaApi.get("/events", {
+          params: {
+            slug: derivedEventSlug,
+            limit: 1,
+          },
+        });
+        const eventResults = Array.isArray(eventLookupResponse.data)
+          ? eventLookupResponse.data
+          : eventLookupResponse.data?.data ||
+            eventLookupResponse.data?.events ||
+            [];
+        const matchedEvent = eventResults[0];
+        const groupedContracts = buildGroupedContracts(
+          matchedEvent,
+          transformed._id,
+        );
+        if (groupedContracts.length > 0) {
+          transformed.groupContracts = groupedContracts;
+          transformed.eventId = transformed.eventId || matchedEvent?.id || null;
+        }
+      } catch (_error) {
+        // Non-fatal fallback; market detail still returns without grouped contracts.
+      }
+    }
+  }
+
   const [enriched] = await attachLocalOutcomeStats([transformed]);
 
   return response.success(res, enriched || transformed);
