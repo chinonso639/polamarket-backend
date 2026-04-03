@@ -10,6 +10,10 @@
  */
 
 const logger = require("../utils/logger");
+const {
+  normalizeOutcomeKey,
+  normalizeOutcomeStates,
+} = require("../utils/marketState");
 
 /**
  * Risk thresholds configuration
@@ -50,7 +54,10 @@ const RISK_CONFIG = {
  */
 function checkPositionLimits({ user, market, existingPosition, tradeAmount }) {
   const totalLiquidity =
-    market.yesPool + market.noPool + market.virtualLiquidityBuffer;
+    normalizeOutcomeStates(market).reduce(
+      (sum, state) => sum + (Number(state.pool) || 0),
+      0,
+    ) + (market.virtualLiquidityBuffer || 0);
   const maxPosition = totalLiquidity * RISK_CONFIG.MAX_POSITION_PERCENT;
   const userMaxPosition = user.maxPositionSize || 5000;
 
@@ -96,24 +103,39 @@ function checkPositionLimits({ user, market, existingPosition, tradeAmount }) {
  * @param {number} shares - Shares being purchased
  * @returns {Object} - { allowed, reason, warning }
  */
-function checkLiquidityProtection(market, outcome, shares) {
-  const totalLiquidity = market.yesPool + market.noPool;
+function checkLiquidityProtection(market, outcome, shares, tradeSide = "buy") {
+  const normalizedOutcome = normalizeOutcomeKey(outcome);
+  const outcomeStates = normalizeOutcomeStates(market);
+  const pooledLiquidity = outcomeStates.reduce(
+    (sum, state) => sum + (Number(state.pool) || 0),
+    0,
+  );
+  const totalLiquidity = pooledLiquidity + (market.virtualLiquidityBuffer || 0);
+  const selectedState = outcomeStates.find(
+    (state) => state.key === normalizedOutcome,
+  );
 
-  // If buying YES, the NO pool effectively decreases in relative terms
-  // We need to ensure there's enough liquidity on both sides
+  if (!selectedState) {
+    return {
+      allowed: false,
+      reason: `Outcome ${normalizedOutcome} is not available in this market`,
+      code: "INVALID_OUTCOME",
+    };
+  }
 
   const minLiquidity = totalLiquidity * RISK_CONFIG.MIN_LIQUIDITY_RATIO;
   const warningLiquidity =
     totalLiquidity * RISK_CONFIG.LIQUIDITY_WARNING_THRESHOLD;
 
-  let resultingLiquidity;
-  if (outcome === "YES") {
-    resultingLiquidity = market.noPool;
-  } else {
-    resultingLiquidity = market.yesPool;
-  }
+  const currentSideLiquidity = Number(selectedState.pool) || 0;
+  const resultingLiquidity =
+    tradeSide === "sell"
+      ? Math.max(0, currentSideLiquidity - shares)
+      : currentSideLiquidity + shares;
 
-  if (resultingLiquidity < minLiquidity) {
+  // Buy orders add liquidity to the selected side and should not be blocked here.
+  // The drain check applies only to sell-like flows that remove side liquidity.
+  if (tradeSide === "sell" && resultingLiquidity < minLiquidity) {
     return {
       allowed: false,
       reason: "Trade would drain too much liquidity from one side",
@@ -186,7 +208,10 @@ function calculateDynamicFee(market, tradeAmount) {
   let feeRate = RISK_CONFIG.BASE_FEE_RATE;
 
   const totalLiquidity =
-    market.yesPool + market.noPool + market.virtualLiquidityBuffer;
+    normalizeOutcomeStates(market).reduce(
+      (sum, state) => sum + (Number(state.pool) || 0),
+      0,
+    ) + (market.virtualLiquidityBuffer || 0);
 
   // Increase fee if liquidity is low
   if (totalLiquidity < 1000) {
@@ -291,7 +316,12 @@ function assessTradeRisk({
   }
 
   // 2. Check liquidity protection
-  const liquidityCheck = checkLiquidityProtection(market, outcome, amount);
+  const liquidityCheck = checkLiquidityProtection(
+    market,
+    outcome,
+    amount,
+    "buy",
+  );
   if (!liquidityCheck.allowed) {
     assessment.allowed = false;
     assessment.reason = liquidityCheck.reason;

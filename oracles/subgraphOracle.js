@@ -223,8 +223,21 @@ async function checkFallbackOracle(conditionId) {
  */
 async function pollResolutions() {
   try {
-    // Get unresolved markets with external condition IDs
+    // Only poll markets that currently have unsettled user exposure.
+    // This keeps polling load aligned with active positions.
+    const activeMarketIds = await Bet.distinct("marketId", {
+      settled: false,
+      marketId: { $ne: null },
+    });
+
+    if (!activeMarketIds.length) {
+      logger.debug("Skipping resolution poll: no markets with unsettled bets");
+      return;
+    }
+
+    // Get unresolved external markets with condition IDs that also have unsettled bets
     const unresolvedMarkets = await Market.find({
+      _id: { $in: activeMarketIds },
       resolved: false,
       conditionId: { $exists: true, $ne: null },
       externalSource: { $in: ["polymarket", "gamma"] },
@@ -233,10 +246,15 @@ async function pollResolutions() {
       .lean();
 
     if (unresolvedMarkets.length === 0) {
+      logger.debug(
+        "Skipping resolution poll: no unresolved external markets with active positions",
+      );
       return;
     }
 
-    logger.debug(`Polling resolutions for ${unresolvedMarkets.length} markets`);
+    logger.debug(
+      `Polling resolutions for ${unresolvedMarkets.length} markets with unsettled positions`,
+    );
 
     const conditionIds = unresolvedMarkets.map((m) => m.conditionId);
 

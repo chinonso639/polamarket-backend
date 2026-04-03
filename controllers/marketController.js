@@ -10,8 +10,7 @@ const User = require("../models/User");
 const axios = require("axios");
 const {
   getPrices,
-  buyYes,
-  buyNo,
+  buyShares,
   calculateSlippage,
   calculateSharesForCost,
   calculateCostForShares,
@@ -34,6 +33,209 @@ const {
   emitMarketUpdate,
   emitMarketResolved,
 } = require("../services/socketService");
+const {
+  buildCompatibilityFields,
+  buildOutcomeStatesFromProbabilities,
+  clampProbability,
+  normalizeOutcomeKey,
+  normalizeOutcomeStates,
+} = require("../utils/marketState");
+
+const RECENT_TRADES_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const buildComputedMarketFields = (market) => {
+  const prices = getPrices(market);
+  return {
+    ...prices,
+    outcomes: prices.outcomes,
+  };
+};
+
+const parseJsonArray = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  return [];
+};
+
+const extractGammaOutcomeStates = (market, liquidity, b) => {
+  const tokens = Array.isArray(market?.tokens) ? market.tokens : [];
+  const tokenLabels = tokens
+    .filter((token) => token?.outcome != null)
+    .map((token) => String(token.outcome));
+  const tokenPrices = tokens
+    .filter((token) => token?.outcome != null)
+    .map((token) =>
+      clampProbability(token.price ?? token.lastPrice ?? token.mid),
+    );
+
+  if (tokenLabels.length > 0) {
+    return buildOutcomeStatesFromProbabilities({
+      outcomes: tokenLabels,
+      probabilities: tokenPrices,
+      liquidity,
+      b,
+    });
+  }
+
+  const labels = parseJsonArray(market?.outcomes).map((value) => String(value));
+  const probabilities = parseJsonArray(market?.outcomePrices).map((value) =>
+    clampProbability(value),
+  );
+
+  if (labels.length > 0) {
+    return buildOutcomeStatesFromProbabilities({
+      outcomes: labels,
+      probabilities,
+      liquidity,
+      b,
+    });
+  }
+
+  return buildOutcomeStatesFromProbabilities({
+    outcomes: ["Yes", "No"],
+    probabilities: [0.5, 0.5],
+    liquidity,
+    b,
+  });
+};
+
+const syncExternalOutcomeStates = async (market, requestedOutcome = null) => {
+  if (!market?.externalId || market.externalSource !== "gamma") {
+    return market;
+  }
+
+  const currentKeys = new Set(
+    normalizeOutcomeStates(market).map((state) => state.key),
+  );
+  const normalizedRequested = requestedOutcome
+    ? normalizeOutcomeKey(requestedOutcome)
+    : null;
+
+  if (market.outcomeStates?.length > 0) {
+    if (!normalizedRequested || currentKeys.has(normalizedRequested)) {
+      return market;
+    }
+  }
+
+  try {
+    const { data: raw } = await axios.get(
+      `${GAMMA_API_URL}/markets/${market.externalId}`,
+      {
+        timeout: 10000,
+      },
+    );
+    const gammaMarket = Array.isArray(raw) ? raw[0] : raw;
+    if (!gammaMarket) {
+      return market;
+    }
+
+    const extLiq = parseFloat(
+      gammaMarket.liquidity ||
+        gammaMarket.liquidityNum ||
+        market.totalVolume ||
+        10000,
+    );
+    const b = Math.max(
+      50,
+      Math.min(
+        5000,
+        Number(market.b) ||
+          normalizeExternalLiquidity(extLiq, market.totalVolume || 1000),
+      ),
+    );
+
+    market.b = b;
+    market.outcomeStates = extractGammaOutcomeStates(gammaMarket, extLiq, b);
+    await market.save();
+
+    return market;
+  } catch (error) {
+    logger.warn(
+      `Unable to refresh Gamma outcomes for market ${market._id}: ${error.message}`,
+    );
+    return market;
+  }
+};
+
+const attachTradeStatsToOutcomes = async (markets) => {
+  if (!Array.isArray(markets) || markets.length === 0) {
+    return markets;
+  }
+
+  const marketIds = markets
+    .map((market) => market?._id)
+    .filter((value) => Boolean(value));
+
+  if (marketIds.length === 0) {
+    return markets;
+  }
+
+  const recentCutoff = new Date(Date.now() - RECENT_TRADES_WINDOW_MS);
+
+  const aggregated = await Transaction.aggregate([
+    {
+      $match: {
+        marketId: { $in: marketIds },
+        type: { $in: ["trade_buy", "trade_sell"] },
+        status: "completed",
+        "tradeDetails.outcome": { $exists: true, $ne: null },
+      },
+    },
+    {
+      $group: {
+        _id: {
+          marketId: "$marketId",
+          outcome: "$tradeDetails.outcome",
+        },
+        volume: { $sum: { $ifNull: ["$amount", 0] } },
+        recentTrades: {
+          $sum: {
+            $cond: [{ $gte: ["$createdAt", recentCutoff] }, 1, 0],
+          },
+        },
+      },
+    },
+  ]);
+
+  const statsByMarket = new Map();
+  for (const item of aggregated) {
+    const marketId = String(item._id.marketId);
+    if (!statsByMarket.has(marketId)) {
+      statsByMarket.set(marketId, {});
+    }
+    statsByMarket.get(marketId)[String(item._id.outcome).toUpperCase()] = {
+      volume: Number(item.volume || 0),
+      recentTrades: Number(item.recentTrades || 0),
+    };
+  }
+
+  return markets.map((market) => {
+    const stats = statsByMarket.get(String(market._id)) || {};
+    const outcomes = (market.outcomes || []).map((outcome) => {
+      const stat = stats[String(outcome.key || "").toUpperCase()] || {};
+      return {
+        ...outcome,
+        volume: (outcome.volume || 0) + (stat.volume || 0),
+        recentTrades: (outcome.recentTrades || 0) + (stat.recentTrades || 0),
+      };
+    });
+
+    return {
+      ...market,
+      outcomes,
+    };
+  });
+};
 
 /**
  * GET /api/markets
@@ -86,12 +288,14 @@ const getMarkets = asyncHandler(async (req, res) => {
   // Add computed prices to each market
   const marketsWithPrices = markets.map((market) => ({
     ...market,
-    ...getPrices(market),
+    ...buildComputedMarketFields(market),
   }));
+
+  const enrichedMarkets = await attachTradeStatsToOutcomes(marketsWithPrices);
 
   return response.paginated(
     res,
-    marketsWithPrices,
+    enrichedMarkets,
     parseInt(page),
     parseInt(limit),
     total,
@@ -109,10 +313,12 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
 
   const marketsWithPrices = markets.map((market) => ({
     ...market,
-    ...getPrices(market),
+    ...buildComputedMarketFields(market),
   }));
 
-  return response.success(res, marketsWithPrices);
+  const enrichedMarkets = await attachTradeStatsToOutcomes(marketsWithPrices);
+
+  return response.success(res, enrichedMarkets);
 });
 
 /**
@@ -132,12 +338,16 @@ const getMarket = asyncHandler(async (req, res) => {
   const positionSummary = await Bet.getMarketPositionSummary(marketId);
 
   // Calculate prices
-  const prices = getPrices(market);
+  const [enrichedMarket] = await attachTradeStatsToOutcomes([
+    {
+      ...market,
+      ...buildComputedMarketFields(market),
+      positionSummary,
+    },
+  ]);
 
   return response.success(res, {
-    ...market,
-    ...prices,
-    positionSummary,
+    ...enrichedMarket,
   });
 });
 
@@ -173,6 +383,7 @@ const createMarket = asyncHandler(async (req, res) => {
     feeRate,
     imageUrl,
     tags,
+    outcomes = ["Yes", "No"],
   } = req.body;
 
   // Calculate initial liquidity parameter if not provided
@@ -185,6 +396,12 @@ const createMarket = asyncHandler(async (req, res) => {
     category,
     endDate,
     b: liquidityParam,
+    outcomeStates: buildOutcomeStatesFromProbabilities({
+      outcomes,
+      probabilities: outcomes.map(() => 1 / outcomes.length),
+      liquidity: 0,
+      b: liquidityParam,
+    }),
     feeRate: feeRate || 0.02,
     imageUrl,
     tags,
@@ -200,7 +417,7 @@ const createMarket = asyncHandler(async (req, res) => {
     res,
     {
       ...market.toObject(),
-      ...getPrices(market),
+      ...buildComputedMarketFields(market),
     },
     "Market created successfully",
   );
@@ -221,18 +438,18 @@ const GAMMA_API_URL =
  *   2. MongoDB by externalId (Gamma markets already imported)
  *   3. Gamma API fetch → create local AMM market with LMSR params seeded from Gamma prices
  */
-const ensureMarket = async (marketId) => {
+const ensureMarket = async (marketId, requestedOutcome = null) => {
   // 1. Try direct ObjectId lookup (throws if invalid ObjectId format)
   try {
     const m = await Market.findById(marketId);
-    if (m) return m;
+    if (m) return syncExternalOutcomeStates(m, requestedOutcome);
   } catch (_) {
     // Not a valid ObjectId — continue to external lookups
   }
 
   // 2. Already imported from Gamma?
   const existing = await Market.findOne({ externalId: marketId });
-  if (existing) return existing;
+  if (existing) return syncExternalOutcomeStates(existing, requestedOutcome);
 
   // 3. Fetch from Gamma and auto-create
   const { data: raw } = await axios.get(
@@ -245,27 +462,6 @@ const ensureMarket = async (marketId) => {
   const gm = Array.isArray(raw) ? raw[0] : raw;
   if (!gm || !gm.question) return null;
 
-  // Resolve prices from Gamma tokens or outcomePrices
-  let yesPrice = 0.5;
-  let noPrice = 0.5;
-  const tokens = gm.tokens || [];
-  if (tokens.length >= 2) {
-    const yT = tokens.find((t) => t.outcome === "Yes");
-    const nT = tokens.find((t) => t.outcome === "No");
-    yesPrice = parseFloat(yT?.price ?? 0.5);
-    noPrice = parseFloat(nT?.price ?? 0.5);
-  } else if (gm.outcomePrices) {
-    try {
-      const p = JSON.parse(gm.outcomePrices);
-      yesPrice = parseFloat(p[0]) || 0.5;
-      noPrice = parseFloat(p[1]) || 0.5;
-    } catch (_) {}
-  }
-  // Normalise so they sum to 1
-  const total = yesPrice + noPrice || 1;
-  yesPrice = Math.max(0.01, Math.min(0.99, yesPrice / total));
-  noPrice = Math.max(0.01, Math.min(0.99, noPrice / total));
-
   // Derive LMSR 'b' from Gamma liquidity/volume
   const extLiq = parseFloat(gm.liquidity || gm.liquidityNum || 10000);
   const extVol = parseFloat(gm.volume || gm.volumeNum || 1000);
@@ -274,11 +470,8 @@ const ensureMarket = async (marketId) => {
     Math.min(5000, normalizeExternalLiquidity(extLiq, extVol)),
   );
 
-  // Initialise qYes / qNo so LMSR produces the correct Gamma prices.
-  // Shift so the smaller value = 0 (both stay >= 0, satisfying schema min:0).
-  const minP = Math.min(yesPrice, noPrice);
-  const qYes = b * Math.log(yesPrice / minP); // >= 0
-  const qNo = b * Math.log(noPrice / minP); // >= 0 (one will be 0)
+  const outcomeStates = extractGammaOutcomeStates(gm, extLiq, b);
+  const compatibilityFields = buildCompatibilityFields({}, outcomeStates);
 
   // Always use a future endDate for our local AMM — Gamma's resolution dates
   // are often in the past, which would make canTrade() return "expired".
@@ -293,11 +486,12 @@ const ensureMarket = async (marketId) => {
     description: gm.description || "",
     category: "other",
     endDate,
-    qYes,
-    qNo,
+    outcomeStates,
+    qYes: compatibilityFields.qYes,
+    qNo: compatibilityFields.qNo,
     b,
-    yesPool: extLiq * yesPrice,
-    noPool: extLiq * noPrice,
+    yesPool: compatibilityFields.yesPool,
+    noPool: compatibilityFields.noPool,
     virtualLiquidityBuffer: b * 10,
     totalVolume: extVol,
     externalId: gm.id || gm.condition_id || marketId,
@@ -317,10 +511,12 @@ const executeTrade = asyncHandler(async (req, res) => {
   const { id: marketId } = req.params;
   const { outcome, amount, maxSlippage = 0.1 } = req.body;
   const userId = req.userId;
+  const normalizedOutcome = normalizeOutcomeKey(outcome);
+  const tradeAmount = parseFloat(amount);
 
   // Get market (auto-create from Gamma if it doesn't exist locally) and user
   const [market, user] = await Promise.all([
-    ensureMarket(marketId),
+    ensureMarket(marketId, normalizedOutcome),
     User.findById(userId),
   ]);
 
@@ -337,8 +533,12 @@ const executeTrade = asyncHandler(async (req, res) => {
     return response.error(res, canTrade.reason, 400);
   }
 
+  if (!Number.isFinite(tradeAmount) || tradeAmount <= 0) {
+    return response.error(res, "Amount must be a positive number", 400);
+  }
+
   // Check user balance
-  if (user.balance < amount) {
+  if (user.balance < tradeAmount) {
     return response.error(res, "Insufficient balance", 400);
   }
 
@@ -356,9 +556,9 @@ const executeTrade = asyncHandler(async (req, res) => {
   const riskAssessment = assessTradeRisk({
     user,
     market,
-    outcome,
-    amount,
-    existingPosition: existingPosition[outcome],
+    outcome: normalizedOutcome,
+    amount: tradeAmount,
+    existingPosition: existingPosition[normalizedOutcome],
     recentTrades,
   });
 
@@ -372,15 +572,16 @@ const executeTrade = asyncHandler(async (req, res) => {
   // Apply dynamic fee if adjusted
   const effectiveFeeRate = riskAssessment.adjustments.feeRate || market.feeRate;
   const marketWithFee = { ...market.toObject(), feeRate: effectiveFeeRate };
+  const selectedOutcomeState = normalizeOutcomeStates(marketWithFee).find(
+    (state) => state.key === normalizedOutcome,
+  );
 
   // Execute trade based on outcome
   let tradeResult;
   try {
-    if (outcome === "YES") {
-      tradeResult = buyYes(marketWithFee, amount, { maxSlippage });
-    } else {
-      tradeResult = buyNo(marketWithFee, amount, { maxSlippage });
-    }
+    tradeResult = buyShares(marketWithFee, normalizedOutcome, tradeAmount, {
+      maxSlippage,
+    });
   } catch (error) {
     return response.error(res, error.message, 400);
   }
@@ -395,6 +596,7 @@ const executeTrade = asyncHandler(async (req, res) => {
         $set: {
           qYes: tradeResult.marketUpdate.qYes,
           qNo: tradeResult.marketUpdate.qNo,
+          outcomeStates: tradeResult.marketUpdate.outcomeStates,
           yesPool: tradeResult.marketUpdate.yesPool || market.yesPool,
           noPool: tradeResult.marketUpdate.noPool || market.noPool,
         },
@@ -413,8 +615,8 @@ const executeTrade = asyncHandler(async (req, res) => {
       userId,
       {
         $inc: {
-          balance: -amount,
-          totalWagered: amount,
+          balance: -tradeAmount,
+          totalWagered: tradeAmount,
         },
         $set: { lastTradeAt: new Date() },
       },
@@ -425,17 +627,18 @@ const executeTrade = asyncHandler(async (req, res) => {
     const bet = new Bet({
       userId,
       marketId: localMarketId,
-      outcome,
+      outcome: normalizedOutcome,
+      outcomeLabel: selectedOutcomeState?.label || normalizedOutcome,
       shares: tradeResult.shares,
-      amountSpent: amount,
+      amountSpent: tradeAmount,
       avgPrice: tradeResult.avgPrice,
       entryPrice: tradeResult.entryPrice,
       feePaid: tradeResult.fee,
       executionDetails: {
         priceBeforeTrade:
-          tradeResult.pricesBefore[outcome.toLowerCase() + "Price"],
+          tradeResult.pricesBefore.outcomePrices?.[normalizedOutcome],
         priceAfterTrade:
-          tradeResult.pricesAfter[outcome.toLowerCase() + "Price"],
+          tradeResult.pricesAfter.outcomePrices?.[normalizedOutcome],
         slippage: tradeResult.slippage,
         qYesBefore: market.qYes,
         qNoBefore: market.qNo,
@@ -454,16 +657,17 @@ const executeTrade = asyncHandler(async (req, res) => {
     const transaction = new Transaction({
       userId,
       type: "trade_buy",
-      amount,
+      amount: tradeAmount,
       fee: tradeResult.fee,
       netAmount: tradeResult.amountAfterFee,
       status: "completed",
       marketId: localMarketId,
       betId: bet._id,
       balanceBefore: user.balance,
-      balanceAfter: user.balance - amount,
+      balanceAfter: user.balance - tradeAmount,
       tradeDetails: {
-        outcome,
+        outcome: normalizedOutcome,
+        outcomeLabel: selectedOutcomeState?.label || normalizedOutcome,
         shares: tradeResult.shares,
         pricePerShare: tradeResult.avgPrice,
         slippage: tradeResult.slippage,
@@ -477,8 +681,8 @@ const executeTrade = asyncHandler(async (req, res) => {
       signature: signTransactionLog({
         userId,
         marketId: localMarketId,
-        outcome,
-        amount,
+        outcome: normalizedOutcome,
+        amount: tradeAmount,
         shares: tradeResult.shares,
       }),
     });
@@ -526,20 +730,22 @@ const executeTrade = asyncHandler(async (req, res) => {
 
     // Emit Socket.io events (to both individual market room and all markets room)
     emitPriceUpdate(localMarketId, {
-      yesPrice: tradeResult.pricesAfter.yes,
-      noPrice: tradeResult.pricesAfter.no,
-      volume: market.totalVolume + amount,
+      yesPrice: tradeResult.pricesAfter.yesPrice,
+      noPrice: tradeResult.pricesAfter.noPrice,
+      outcomePrices: tradeResult.pricesAfter.outcomePrices,
+      volume: market.totalVolume + tradeAmount,
     });
 
     emitTrade(localMarketId, {
-      outcome,
-      amount,
+      outcome: normalizedOutcome,
+      outcomeLabel: selectedOutcomeState?.label || normalizedOutcome,
+      amount: tradeAmount,
       shares: tradeResult.shares,
       newPrices: tradeResult.pricesAfter,
     });
 
     logger.info(
-      `Trade executed: ${userId} bought ${tradeResult.shares.toFixed(4)} ${outcome} for $${amount}`,
+      `Trade executed: ${userId} bought ${tradeResult.shares.toFixed(4)} ${normalizedOutcome} for $${tradeAmount}`,
     );
 
     return response.tradeSuccess(res, {
@@ -578,10 +784,7 @@ const previewSlippage = asyncHandler(async (req, res) => {
 const resolveMarket = asyncHandler(async (req, res) => {
   const { id: marketId } = req.params;
   const { outcome, resolutionSource } = req.body;
-
-  if (!["YES", "NO"].includes(outcome)) {
-    return response.error(res, "Outcome must be YES or NO", 400);
-  }
+  const normalizedOutcome = normalizeOutcomeKey(outcome);
 
   const market = await Market.findById(marketId);
 
@@ -593,10 +796,21 @@ const resolveMarket = asyncHandler(async (req, res) => {
     return response.error(res, "Market already resolved", 400);
   }
 
+  const validOutcomes = new Set(
+    normalizeOutcomeStates(market).map((state) => state.key),
+  );
+  if (!validOutcomes.has(normalizedOutcome)) {
+    return response.error(
+      res,
+      `Outcome must be one of: ${[...validOutcomes].join(", ")}`,
+      400,
+    );
+  }
+
   // Freeze trading immediately
   market.isTradingActive = false;
   market.resolved = true;
-  market.outcome = outcome;
+  market.outcome = normalizedOutcome;
   market.resolutionSource = resolutionSource;
   market.resolvedAt = new Date();
   market.resolvedBy = req.userId;
@@ -604,9 +818,9 @@ const resolveMarket = asyncHandler(async (req, res) => {
   await market.save();
 
   // Emit resolution event (to both individual market room and all markets room)
-  emitMarketResolved(marketId, outcome);
+  emitMarketResolved(marketId, normalizedOutcome);
 
-  logger.info(`Market resolved: ${marketId} -> ${outcome}`);
+  logger.info(`Market resolved: ${marketId} -> ${normalizedOutcome}`);
 
   // Invalidate cache
   invalidateMarket(marketId);
@@ -677,10 +891,12 @@ const getFeaturedMarkets = asyncHandler(async (req, res) => {
 
   const marketsWithPrices = markets.map((market) => ({
     ...market,
-    ...getPrices(market),
+    ...buildComputedMarketFields(market),
   }));
 
-  return response.success(res, marketsWithPrices);
+  const enrichedMarkets = await attachTradeStatsToOutcomes(marketsWithPrices);
+
+  return response.success(res, enrichedMarkets);
 });
 
 /**
@@ -736,12 +952,14 @@ const searchMarkets = asyncHandler(async (req, res) => {
 
   const marketsWithPrices = markets.map((market) => ({
     ...market,
-    ...getPrices(market),
+    ...buildComputedMarketFields(market),
   }));
+
+  const enrichedMarkets = await attachTradeStatsToOutcomes(marketsWithPrices);
 
   return response.paginated(
     res,
-    marketsWithPrices,
+    enrichedMarkets,
     parseInt(page),
     parseInt(limit),
     total,
@@ -796,6 +1014,7 @@ const getPriceHistory = asyncHandler(async (req, res) => {
  */
 const getOrderBook = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const requestedOutcome = normalizeOutcomeKey(req.query.outcome || "YES");
 
   const market = await Market.findById(id).select("qYes qNo b").lean();
 
@@ -804,6 +1023,13 @@ const getOrderBook = asyncHandler(async (req, res) => {
   }
 
   const currentPrices = getPrices(market);
+  if (!currentPrices.outcomePrices?.[requestedOutcome]) {
+    return response.error(
+      res,
+      `Outcome ${requestedOutcome} is not available`,
+      400,
+    );
+  }
 
   // Generate simulated order book depth
   const depths = [10, 50, 100, 500, 1000];
@@ -812,18 +1038,24 @@ const getOrderBook = asyncHandler(async (req, res) => {
 
   for (const amount of depths) {
     // Calculate price impact for YES buys (asks)
-    const yesCost = calculateCostForShares(market, "YES", amount);
-    const avgYesPrice = yesCost / amount;
-    asks.push({ price: avgYesPrice.toFixed(4), size: amount });
+    const buyCost = calculateCostForShares(market, requestedOutcome, amount);
+    const avgAskPrice = buyCost / amount;
+    asks.push({ price: avgAskPrice.toFixed(4), size: amount });
 
-    // Calculate price impact for NO buys (bids for YES)
-    const noCost = calculateCostForShares(market, "NO", amount);
-    const impliedYesBid = 1 - noCost / amount;
-    bids.push({ price: Math.max(0, impliedYesBid).toFixed(4), size: amount });
+    const sellValue = lmsrSellShares(
+      market,
+      requestedOutcome,
+      amount,
+    ).grossProceeds;
+    bids.push({
+      price: Math.max(0, sellValue / amount).toFixed(4),
+      size: amount,
+    });
   }
 
   return response.success(res, {
-    currentPrice: currentPrices.yesPrice,
+    currentPrice: currentPrices.outcomePrices[requestedOutcome],
+    outcome: requestedOutcome,
     bids: bids.reverse(),
     asks,
   });
@@ -839,11 +1071,11 @@ const getRecentTrades = asyncHandler(async (req, res) => {
 
   const trades = await Transaction.find({
     marketId: id,
-    type: "BET",
+    type: { $in: ["trade_buy", "trade_sell"] },
   })
     .sort({ createdAt: -1 })
     .limit(limit)
-    .select("amount outcome shares avgPrice createdAt")
+    .select("amount type tradeDetails createdAt")
     .lean();
 
   return response.success(res, trades);
@@ -856,12 +1088,13 @@ const getRecentTrades = asyncHandler(async (req, res) => {
 const getQuote = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { outcome, amount } = req.body;
+  const normalizedOutcome = normalizeOutcomeKey(outcome);
 
   if (!outcome || !amount) {
     return response.error(res, "Outcome and amount required", 400);
   }
 
-  const market = await ensureMarket(id);
+  const market = await ensureMarket(id, normalizedOutcome);
 
   if (!market) {
     return response.notFound(res, "Market");
@@ -871,13 +1104,17 @@ const getQuote = asyncHandler(async (req, res) => {
   const feeRate = market.feeRate || 0.02;
   const amt = parseFloat(amount);
   const amountAfterFee = amt * (1 - feeRate);
-  const { shares } = calculateSharesForCost(market, outcome, amountAfterFee);
+  const { shares } = calculateSharesForCost(
+    market,
+    normalizedOutcome,
+    amountAfterFee,
+  );
   const fee = amt * feeRate;
   const avgPrice = amountAfterFee / shares;
-  const slippageInfo = calculateSlippage(market, outcome, amt);
+  const slippageInfo = calculateSlippage(market, normalizedOutcome, amt);
 
   return response.success(res, {
-    outcome,
+    outcome: normalizedOutcome,
     shares,
     cost: amountAfterFee,
     fee,
@@ -885,8 +1122,7 @@ const getQuote = asyncHandler(async (req, res) => {
     avgPrice,
     slippage: slippageInfo.slippage,
     priceImpact: slippageInfo.priceImpact,
-    currentPrice:
-      outcome === "YES" ? pricesBefore.yesPrice : pricesBefore.noPrice,
+    currentPrice: pricesBefore.outcomePrices?.[normalizedOutcome],
     potentialReturn: shares,
     potentialProfit: shares - amt,
   });
@@ -900,18 +1136,14 @@ const sellShares = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { outcome, shares } = req.body;
   const userId = req.userId;
-  const normalizedOutcome = String(outcome || "").toUpperCase();
+  const normalizedOutcome = normalizeOutcomeKey(outcome);
   const sellSharesAmount = parseFloat(shares);
 
-  if (
-    !["YES", "NO"].includes(normalizedOutcome) ||
-    !sellSharesAmount ||
-    sellSharesAmount <= 0
-  ) {
+  if (!sellSharesAmount || sellSharesAmount <= 0) {
     return response.error(res, "Valid outcome and shares required", 400);
   }
 
-  const market = await Market.findById(id);
+  const market = await ensureMarket(id, normalizedOutcome);
 
   if (!market || !market.isTradingActive || market.resolved) {
     return response.error(res, "Market not available for trading", 400);
@@ -953,6 +1185,9 @@ const sellShares = asyncHandler(async (req, res) => {
   // Update market state and accounting
   market.qYes = sellResult.marketUpdate.qYes;
   market.qNo = sellResult.marketUpdate.qNo;
+  market.outcomeStates = sellResult.marketUpdate.outcomeStates;
+  market.yesPool = sellResult.marketUpdate.yesPool;
+  market.noPool = sellResult.marketUpdate.noPool;
   market.totalFeesCollected = (market.totalFeesCollected || 0) + fee;
   market.totalTrades = (market.totalTrades || 0) + 1;
   market.settlementPool = Math.max(
@@ -1018,6 +1253,10 @@ const sellShares = asyncHandler(async (req, res) => {
     status: "completed",
     tradeDetails: {
       outcome: normalizedOutcome,
+      outcomeLabel:
+        normalizeOutcomeStates(market).find(
+          (state) => state.key === normalizedOutcome,
+        )?.label || normalizedOutcome,
       shares: sellSharesAmount,
       pricePerShare: sellResult.grossProceeds / sellSharesAmount,
       slippage: 0,

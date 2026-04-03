@@ -9,6 +9,10 @@
  */
 
 const mongoose = require("mongoose");
+const {
+  buildCompatibilityFields,
+  normalizeOutcomeStates,
+} = require("../utils/marketState");
 
 const marketSchema = new mongoose.Schema(
   {
@@ -64,6 +68,34 @@ const marketSchema = new mongoose.Schema(
       min: [1, "Liquidity parameter must be at least 1"],
       max: [10000, "Liquidity parameter cannot exceed 10000"],
     },
+    outcomeStates: [
+      {
+        key: {
+          type: String,
+          required: true,
+          trim: true,
+        },
+        label: {
+          type: String,
+          required: true,
+          trim: true,
+        },
+        quantity: {
+          type: Number,
+          default: 0,
+          min: [0, "Outcome quantity cannot be negative"],
+        },
+        pool: {
+          type: Number,
+          default: 0,
+          min: [0, "Outcome pool cannot be negative"],
+        },
+        order: {
+          type: Number,
+          default: 0,
+        },
+      },
+    ],
 
     // Secondary pool tracking (for UX and liquidity display)
     yesPool: {
@@ -101,7 +133,6 @@ const marketSchema = new mongoose.Schema(
     },
     outcome: {
       type: String,
-      enum: ["YES", "NO", null],
       default: null,
     },
     resolutionSource: {
@@ -178,6 +209,7 @@ const marketSchema = new mongoose.Schema(
         timestamp: Date,
         yesPrice: Number,
         noPrice: Number,
+        outcomePrices: mongoose.Schema.Types.Mixed,
       },
     ],
 
@@ -223,19 +255,46 @@ const marketSchema = new mongoose.Schema(
 
 // Virtual for current YES price (LMSR formula)
 marketSchema.virtual("yesPrice").get(function () {
-  const expYes = Math.exp(this.qYes / this.b);
-  const expNo = Math.exp(this.qNo / this.b);
-  return expYes / (expYes + expNo);
+  const states = normalizeOutcomeStates(this);
+  const yesState = states.find((state) => state.key === "YES");
+  if (!yesState) return null;
+
+  const b = Math.max(1, this.b || 100);
+  const quantities = states.map((state) => Number(state.quantity) || 0);
+  const maxQuantity = Math.max(...quantities);
+  const weights = states.map((state) =>
+    Math.exp(((Number(state.quantity) || 0) - maxQuantity) / b),
+  );
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+  const yesIndex = states.findIndex((state) => state.key === "YES");
+  return weights[yesIndex] / totalWeight;
 });
 
 // Virtual for current NO price
 marketSchema.virtual("noPrice").get(function () {
-  return 1 - this.yesPrice;
+  const states = normalizeOutcomeStates(this);
+  const noState = states.find((state) => state.key === "NO");
+  if (!noState) return null;
+
+  const b = Math.max(1, this.b || 100);
+  const quantities = states.map((state) => Number(state.quantity) || 0);
+  const maxQuantity = Math.max(...quantities);
+  const weights = states.map((state) =>
+    Math.exp(((Number(state.quantity) || 0) - maxQuantity) / b),
+  );
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+  const noIndex = states.findIndex((state) => state.key === "NO");
+  return weights[noIndex] / totalWeight;
 });
 
 // Virtual for total liquidity
 marketSchema.virtual("totalLiquidity").get(function () {
-  return this.yesPool + this.noPool + this.virtualLiquidityBuffer;
+  const states = normalizeOutcomeStates(this);
+  const pooledLiquidity = states.reduce(
+    (sum, state) => sum + (Number(state.pool) || 0),
+    0,
+  );
+  return pooledLiquidity + this.virtualLiquidityBuffer;
 });
 
 // Virtual for market status
@@ -275,6 +334,19 @@ marketSchema.index({ externalId: 1 });
 marketSchema.index({ conditionId: 1 });
 marketSchema.index({ tags: 1 });
 
+marketSchema.pre("save", function (next) {
+  const states = normalizeOutcomeStates(this);
+  this.outcomeStates = states;
+
+  const compatibilityFields = buildCompatibilityFields(this, states);
+  this.qYes = compatibilityFields.qYes;
+  this.qNo = compatibilityFields.qNo;
+  this.yesPool = compatibilityFields.yesPool;
+  this.noPool = compatibilityFields.noPool;
+
+  next();
+});
+
 // Static method to find active markets
 marketSchema.statics.findActive = function () {
   return this.find({
@@ -312,10 +384,24 @@ marketSchema.methods.canTrade = function () {
 
 // Method to record price snapshot
 marketSchema.methods.recordPriceSnapshot = async function () {
+  const states = normalizeOutcomeStates(this);
+  const b = Math.max(1, this.b || 100);
+  const quantities = states.map((state) => Number(state.quantity) || 0);
+  const maxQuantity = Math.max(...quantities);
+  const weights = states.map((state) =>
+    Math.exp(((Number(state.quantity) || 0) - maxQuantity) / b),
+  );
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
+  const outcomePrices = states.reduce((accumulator, state, index) => {
+    accumulator[state.key] = weights[index] / totalWeight;
+    return accumulator;
+  }, {});
+
   const snapshot = {
     timestamp: new Date(),
     yesPrice: this.yesPrice,
     noPrice: this.noPrice,
+    outcomePrices,
   };
 
   // Keep only last 288 snapshots (24 hours at 5-minute intervals)

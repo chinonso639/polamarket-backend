@@ -4,6 +4,8 @@
  */
 
 const axios = require("axios");
+const Market = require("../models/Market");
+const Transaction = require("../models/Transaction");
 const response = require("../utils/response");
 const logger = require("../utils/logger");
 const { asyncHandler } = require("../middleware/errorHandler");
@@ -28,6 +30,8 @@ const clobApi = axios.create({
     Accept: "application/json",
   },
 });
+
+const RECENT_TRADES_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Map category from tags/question
@@ -270,30 +274,225 @@ const mapCategory = (tags = [], question = "") => {
   return "World";
 };
 
+const normalizeOutcomeKey = (value = "") =>
+  String(value)
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "OUTCOME";
+
+const clampProbability = (value) => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Math.max(0.001, Math.min(0.999, num));
+};
+
+const parseJsonArray = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_error) {
+      return [];
+    }
+  }
+  return [];
+};
+
+const parseMarketOutcomes = (market) => {
+  const tokens = Array.isArray(market.tokens) ? market.tokens : [];
+  const tokenOutcomes = tokens
+    .filter((token) => token && token.outcome != null)
+    .map((token, index) => {
+      const label = String(token.outcome);
+      const rawPrice = token.price ?? token.lastPrice ?? token.mid;
+      return {
+        key: normalizeOutcomeKey(label),
+        label,
+        price: clampProbability(rawPrice),
+        volume: Number(token.volume ?? token.volumeNum ?? 0) || 0,
+        recentTrades: Number(token.recentTrades ?? token.trades ?? 0) || 0,
+        order: index,
+      };
+    });
+
+  if (tokenOutcomes.length > 0) {
+    return tokenOutcomes;
+  }
+
+  const labels = parseJsonArray(market.outcomes).map((value) => String(value));
+  const prices = parseJsonArray(market.outcomePrices).map((value) =>
+    clampProbability(value),
+  );
+
+  if (labels.length > 0) {
+    return labels.map((label, index) => ({
+      key: normalizeOutcomeKey(label),
+      label,
+      price: prices[index] ?? 0.5,
+      volume: 0,
+      recentTrades: 0,
+      order: index,
+    }));
+  }
+
+  if (prices.length > 0) {
+    return prices.map((price, index) => ({
+      key: `OUTCOME_${index + 1}`,
+      label: `Outcome ${index + 1}`,
+      price,
+      volume: 0,
+      recentTrades: 0,
+      order: index,
+    }));
+  }
+
+  return [
+    {
+      key: "YES",
+      label: "Yes",
+      price: 0.5,
+      volume: 0,
+      recentTrades: 0,
+      order: 0,
+    },
+    {
+      key: "NO",
+      label: "No",
+      price: 0.5,
+      volume: 0,
+      recentTrades: 0,
+      order: 1,
+    },
+  ];
+};
+
+const mergeOutcomeStats = (outcomes, statsByOutcome) =>
+  outcomes.map((outcome) => {
+    const stat = statsByOutcome?.[outcome.key] || {};
+    return {
+      ...outcome,
+      volume: (outcome.volume || 0) + (stat.volume || 0),
+      recentTrades: (outcome.recentTrades || 0) + (stat.recentTrades || 0),
+    };
+  });
+
+const attachLocalOutcomeStats = async (markets) => {
+  if (!Array.isArray(markets) || markets.length === 0) {
+    return markets;
+  }
+
+  const externalIds = markets
+    .map((market) => String(market._id || ""))
+    .filter(Boolean);
+  const conditionIds = markets
+    .map((market) => String(market.conditionId || ""))
+    .filter(Boolean);
+
+  if (externalIds.length === 0 && conditionIds.length === 0) {
+    return markets;
+  }
+
+  const localMarkets = await Market.find({
+    $or: [
+      { externalId: { $in: externalIds } },
+      { conditionId: { $in: conditionIds } },
+    ],
+  })
+    .select("_id externalId conditionId")
+    .lean();
+
+  if (!localMarkets.length) {
+    return markets;
+  }
+
+  const localByExternal = new Map();
+  const localByCondition = new Map();
+
+  for (const localMarket of localMarkets) {
+    if (localMarket.externalId) {
+      localByExternal.set(String(localMarket.externalId), localMarket);
+    }
+    if (localMarket.conditionId) {
+      localByCondition.set(String(localMarket.conditionId), localMarket);
+    }
+  }
+
+  const localMarketIds = localMarkets.map((market) => market._id);
+  const recentCutoff = new Date(Date.now() - RECENT_TRADES_WINDOW_MS);
+
+  const aggregated = await Transaction.aggregate([
+    {
+      $match: {
+        marketId: { $in: localMarketIds },
+        type: { $in: ["trade_buy", "trade_sell"] },
+        status: "completed",
+        "tradeDetails.outcome": { $exists: true, $ne: null },
+      },
+    },
+    {
+      $group: {
+        _id: {
+          marketId: "$marketId",
+          outcome: "$tradeDetails.outcome",
+        },
+        volume: { $sum: { $ifNull: ["$amount", 0] } },
+        recentTrades: {
+          $sum: {
+            $cond: [{ $gte: ["$createdAt", recentCutoff] }, 1, 0],
+          },
+        },
+      },
+    },
+  ]);
+
+  const statsByMarket = new Map();
+  for (const item of aggregated) {
+    const marketKey = String(item._id.marketId);
+    const outcomeKey = normalizeOutcomeKey(item._id.outcome);
+    if (!statsByMarket.has(marketKey)) {
+      statsByMarket.set(marketKey, {});
+    }
+    statsByMarket.get(marketKey)[outcomeKey] = {
+      volume: Number(item.volume || 0),
+      recentTrades: Number(item.recentTrades || 0),
+    };
+  }
+
+  return markets.map((market) => {
+    const localMarket =
+      localByExternal.get(String(market._id)) ||
+      localByCondition.get(String(market.conditionId || ""));
+
+    if (!localMarket) return market;
+
+    const stats = statsByMarket.get(String(localMarket._id)) || {};
+
+    return {
+      ...market,
+      outcomes: mergeOutcomeStats(market.outcomes || [], stats),
+    };
+  });
+};
+
 /**
  * Transform Polymarket market to internal format
  */
 const transformMarket = (market) => {
-  let yesPrice = 0.5;
-  let noPrice = 0.5;
+  const outcomes = parseMarketOutcomes(market);
+  const yesOutcome = outcomes.find((outcome) => outcome.key === "YES");
+  const noOutcome = outcomes.find((outcome) => outcome.key === "NO");
+  const totalVolume = parseFloat(market.volume || market.volumeNum || 0);
+  const hasOutcomeVolume = outcomes.some(
+    (outcome) => Number(outcome.volume || 0) > 0,
+  );
+  const fallbackOutcomeVolume =
+    outcomes.length > 0 && totalVolume > 0 ? totalVolume / outcomes.length : 0;
 
-  const tokens = market.tokens || [];
-  if (tokens.length >= 2) {
-    const yesToken = tokens.find((t) => t.outcome === "Yes");
-    const noToken = tokens.find((t) => t.outcome === "No");
-    yesPrice = yesToken?.price || 0.5;
-    noPrice = noToken?.price || 0.5;
-  } else if (market.outcomePrices) {
-    try {
-      const prices = JSON.parse(market.outcomePrices);
-      yesPrice = parseFloat(prices[0]) || 0.5;
-      noPrice = parseFloat(prices[1]) || 0.5;
-    } catch (e) {
-      // Use defaults
-    }
-  } else if (market.bestBid !== undefined) {
-    yesPrice = market.bestBid || 0.5;
-  }
+  const yesPrice = yesOutcome?.price ?? clampProbability(market.bestBid ?? 0.5);
+  const noPrice = noOutcome?.price ?? clampProbability(1 - yesPrice);
 
   const priceChange24h = market.priceChange
     ? parseFloat(market.priceChange) * 100
@@ -307,8 +506,18 @@ const transformMarket = (market) => {
     endDate: market.endDate || market.end_date_iso || market.resolutionDate,
     yesPrice: parseFloat(yesPrice),
     noPrice: parseFloat(noPrice),
+    outcomes: outcomes.map((outcome) => ({
+      key: outcome.key,
+      label: outcome.label,
+      price: outcome.price,
+      probability: outcome.price,
+      volume: hasOutcomeVolume
+        ? Number(outcome.volume || 0)
+        : Number(fallbackOutcomeVolume || 0),
+      recentTrades: Number(outcome.recentTrades || 0),
+    })),
     priceChange24h,
-    totalVolume: parseFloat(market.volume || market.volumeNum || 0),
+    totalVolume,
     liquidity: parseFloat(market.liquidity || market.liquidityNum || 0),
     imageUrl: market.image || market.icon || null,
     slug: market.slug || market.market_slug,
@@ -633,8 +842,9 @@ const getMarkets = asyncHandler(async (req, res) => {
     : response_data.data.markets || response_data.data.data || [];
 
   const transformed = markets.map(transformMarket);
+  const enriched = await attachLocalOutcomeStats(transformed);
 
-  return response.success(res, transformed);
+  return response.success(res, enriched);
 });
 
 /**
@@ -712,7 +922,10 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
     transformed.sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0));
   }
 
-  return response.success(res, transformed.slice(0, limit));
+  const sliced = transformed.slice(0, limit);
+  const enriched = await attachLocalOutcomeStats(sliced);
+
+  return response.success(res, enriched);
 });
 
 /**
@@ -724,8 +937,9 @@ const getMarketById = asyncHandler(async (req, res) => {
 
   const response_data = await gammaApi.get(`/markets/${id}`);
   const transformed = transformMarket(response_data.data);
+  const [enriched] = await attachLocalOutcomeStats([transformed]);
 
-  return response.success(res, transformed);
+  return response.success(res, enriched || transformed);
 });
 
 /**
@@ -760,8 +974,9 @@ const searchMarkets = asyncHandler(async (req, res) => {
   );
 
   const transformed = filtered.slice(0, parseInt(limit)).map(transformMarket);
+  const enriched = await attachLocalOutcomeStats(transformed);
 
-  return response.success(res, transformed);
+  return response.success(res, enriched);
 });
 
 /**

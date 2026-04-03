@@ -1,104 +1,177 @@
 /**
  * LMSR AMM Engine - Core Module
  *
- * Logarithmic Market Scoring Rule (LMSR) based Automated Market Maker
- * This is the PRIMARY pricing system for the prediction market.
- *
- * Key Features:
- * - Bounded pricing curve (prevents liquidity drain)
- * - Exponential price adjustment (anti-arbitrage)
- * - Configurable liquidity parameter 'b'
- * - Fee structure with slippage protection
- *
- * LMSR Formulas:
- * - Price: P(outcome) = exp(q_outcome / b) / Σ exp(q_i / b)
- * - Cost: C(q) = b * log(Σ exp(q_i / b))
- *
- * @author Polamarket Team
+ * Logarithmic Market Scoring Rule (LMSR) based Automated Market Maker.
+ * Supports both legacy binary markets and multi-outcome markets.
  */
 
-/**
- * Calculate the LMSR cost function
- * C(q) = b * ln(exp(qYes/b) + exp(qNo/b))
- *
- * @param {number} qYes - Quantity of YES shares
- * @param {number} qNo - Quantity of NO shares
- * @param {number} b - Liquidity parameter
- * @returns {number} - Market cost
- */
-function calculateCost(qYes, qNo, b) {
-  // Use log-sum-exp trick for numerical stability
-  const maxQ = Math.max(qYes, qNo);
-  const scaledYes = (qYes - maxQ) / b;
-  const scaledNo = (qNo - maxQ) / b;
+const {
+  buildCompatibilityFields,
+  normalizeOutcomeKey,
+  normalizeOutcomeStates,
+} = require("../utils/marketState");
 
-  return b * (maxQ / b + Math.log(Math.exp(scaledYes) + Math.exp(scaledNo)));
+const MIN_PRICE = 0.001;
+const MAX_PRICE = 0.999;
+
+function clampPrice(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return MIN_PRICE;
+  }
+  return Math.max(MIN_PRICE, Math.min(MAX_PRICE, num));
 }
 
-/**
- * Calculate LMSR prices for both outcomes
- * P(YES) = exp(qYes/b) / (exp(qYes/b) + exp(qNo/b))
- *
- * @param {Object} market - Market object with qYes, qNo, and b parameters
- * @returns {Object} - { yesPrice, noPrice }
- */
-function getPrices(market) {
-  const { qYes, qNo, b } = market;
+function getEffectiveLiquidity(market) {
+  return Math.max(1, Number(market?.b) || 100);
+}
 
-  // Use log-sum-exp trick for numerical stability with large values
-  const maxQ = Math.max(qYes, qNo);
-  const expYesNorm = Math.exp((qYes - maxQ) / b);
-  const expNoNorm = Math.exp((qNo - maxQ) / b);
-  const sumExp = expYesNorm + expNoNorm;
+function ensureOutcomeExists(market, outcome) {
+  const normalizedOutcome = normalizeOutcomeKey(outcome);
+  const states = normalizeOutcomeStates(market);
+  const selected = states.find((state) => state.key === normalizedOutcome);
 
-  const yesPrice = expYesNorm / sumExp;
-  const noPrice = expNoNorm / sumExp;
+  if (!selected) {
+    throw new Error(
+      `INVALID_OUTCOME: Outcome ${normalizedOutcome} is not available in this market`,
+    );
+  }
 
   return {
-    yesPrice: Math.max(0.001, Math.min(0.999, yesPrice)), // Clamp to avoid 0 or 1
-    noPrice: Math.max(0.001, Math.min(0.999, noPrice)),
+    normalizedOutcome,
+    states,
+    selected,
   };
 }
 
-/**
- * Calculate the number of shares for a given cost using LMSR
- * Uses numerical approximation (binary search) for accuracy
- *
- * @param {Object} market - Market object
- * @param {string} outcome - 'YES' or 'NO'
- * @param {number} cost - Amount to spend (after fees)
- * @returns {Object} - { shares, newQYes, newQNo, priceAfter }
- */
-function calculateSharesForCost(market, outcome, cost) {
-  const { qYes, qNo, b } = market;
+function calculateCost(outcomesOrMarket, maybeB) {
+  const states = Array.isArray(outcomesOrMarket)
+    ? outcomesOrMarket
+    : normalizeOutcomeStates(outcomesOrMarket);
+  const b = Array.isArray(outcomesOrMarket)
+    ? Math.max(1, Number(maybeB) || 100)
+    : getEffectiveLiquidity(outcomesOrMarket);
 
-  // Current cost
-  const currentCost = calculateCost(qYes, qNo, b);
+  const quantities = states.map((state) => Number(state.quantity) || 0);
+  const maxQuantity = Math.max(...quantities);
+  const sumExp = quantities.reduce((sum, quantity) => {
+    return sum + Math.exp((quantity - maxQuantity) / b);
+  }, 0);
 
-  // Target cost after purchase
-  const targetCost = currentCost + cost;
+  return b * (maxQuantity / b + Math.log(sumExp));
+}
 
-  // Binary search to find the number of shares
-  let low = 0;
-  let high = cost * 100; // Upper bound estimate
-  let shares = 0;
-  const tolerance = 0.0001;
-  const maxIterations = 100;
+function calculatePriceMap(outcomeStates, b) {
+  const quantities = outcomeStates.map((state) => Number(state.quantity) || 0);
+  const maxQuantity = Math.max(...quantities);
+  const weights = outcomeStates.map((state) => ({
+    key: state.key,
+    weight: Math.exp(((Number(state.quantity) || 0) - maxQuantity) / b),
+  }));
+  const totalWeight = weights.reduce((sum, item) => sum + item.weight, 0) || 1;
 
-  for (let i = 0; i < maxIterations; i++) {
-    shares = (low + high) / 2;
+  return weights.reduce((accumulator, item) => {
+    accumulator[item.key] = clampPrice(item.weight / totalWeight);
+    return accumulator;
+  }, {});
+}
 
-    let newQYes = qYes;
-    let newQNo = qNo;
+function buildDisplayedOutcomes(outcomeStates, priceMap) {
+  return outcomeStates.map((state) => ({
+    key: state.key,
+    label: state.label,
+    price: priceMap[state.key],
+    probability: priceMap[state.key],
+    volume: 0,
+    recentTrades: 0,
+    order: state.order,
+  }));
+}
 
-    if (outcome === "YES") {
-      newQYes = qYes + shares;
-    } else {
-      newQNo = qNo + shares;
+function getOutcomePrices(market) {
+  const outcomeStates = normalizeOutcomeStates(market);
+  const b = getEffectiveLiquidity(market);
+  return {
+    outcomeStates,
+    priceMap: calculatePriceMap(outcomeStates, b),
+  };
+}
+
+function getPrices(market) {
+  const { outcomeStates, priceMap } = getOutcomePrices(market);
+  const displayedOutcomes = buildDisplayedOutcomes(outcomeStates, priceMap);
+  const yesPrice = priceMap.YES ?? null;
+  const noPrice = priceMap.NO ?? null;
+
+  return {
+    yesPrice,
+    noPrice,
+    yes: yesPrice,
+    no: noPrice,
+    outcomePrices: priceMap,
+    outcomes: displayedOutcomes,
+  };
+}
+
+function applySharesDelta(outcomeStates, outcomeKey, shareDelta) {
+  return outcomeStates.map((state) => {
+    if (state.key !== outcomeKey) {
+      return state;
     }
 
-    const newCost = calculateCost(newQYes, newQNo, b);
-    const actualCost = newCost - currentCost;
+    return {
+      ...state,
+      quantity: Math.max(0, (Number(state.quantity) || 0) + shareDelta),
+    };
+  });
+}
+
+function applyPoolDelta(outcomeStates, outcomeKey, poolDelta) {
+  return outcomeStates.map((state) => {
+    if (state.key !== outcomeKey) {
+      return state;
+    }
+
+    return {
+      ...state,
+      pool: Math.max(0, (Number(state.pool) || 0) + poolDelta),
+    };
+  });
+}
+
+function buildMarketUpdate(market, outcomeStates) {
+  return {
+    outcomeStates,
+    ...buildCompatibilityFields(market, outcomeStates),
+  };
+}
+
+function calculateSharesForCost(market, outcome, cost) {
+  const { normalizedOutcome, states } = ensureOutcomeExists(market, outcome);
+  const b = getEffectiveLiquidity(market);
+  const currentCost = calculateCost(states, b);
+
+  let low = 0;
+  const entryPrice =
+    calculatePriceMap(states, b)[normalizedOutcome] || MIN_PRICE;
+  let high = Math.max(cost / entryPrice, cost * 100, 1);
+  const tolerance = 0.0001;
+  const maxIterations = 120;
+
+  for (let i = 0; i < 20; i += 1) {
+    const trialStates = applySharesDelta(states, normalizedOutcome, high);
+    const trialCost = calculateCost(trialStates, b) - currentCost;
+    if (trialCost >= cost) {
+      break;
+    }
+    high *= 2;
+  }
+
+  let shares = 0;
+  for (let i = 0; i < maxIterations; i += 1) {
+    shares = (low + high) / 2;
+    const trialStates = applySharesDelta(states, normalizedOutcome, shares);
+    const actualCost = calculateCost(trialStates, b) - currentCost;
 
     if (Math.abs(actualCost - cost) < tolerance) {
       break;
@@ -111,80 +184,39 @@ function calculateSharesForCost(market, outcome, cost) {
     }
   }
 
-  // Calculate final state
-  let newQYes = qYes;
-  let newQNo = qNo;
-
-  if (outcome === "YES") {
-    newQYes = qYes + shares;
-  } else {
-    newQNo = qNo + shares;
-  }
-
-  const pricesAfter = getPrices({ qYes: newQYes, qNo: newQNo, b });
+  const updatedStates = applySharesDelta(states, normalizedOutcome, shares);
+  const pricesAfter = getPrices({ ...market, outcomeStates: updatedStates });
 
   return {
     shares,
-    newQYes,
-    newQNo,
-    priceAfter: outcome === "YES" ? pricesAfter.yesPrice : pricesAfter.noPrice,
+    outcome: normalizedOutcome,
+    updatedStates,
+    priceAfter: pricesAfter.outcomePrices[normalizedOutcome],
+    pricesAfter,
   };
 }
 
-/**
- * Calculate the cost to buy a specific number of shares
- *
- * @param {Object} market - Market object
- * @param {string} outcome - 'YES' or 'NO'
- * @param {number} shares - Number of shares to buy
- * @returns {number} - Cost to buy the shares
- */
 function calculateCostForShares(market, outcome, shares) {
-  const { qYes, qNo, b } = market;
-
-  const currentCost = calculateCost(qYes, qNo, b);
-
-  let newQYes = qYes;
-  let newQNo = qNo;
-
-  if (outcome === "YES") {
-    newQYes = qYes + shares;
-  } else {
-    newQNo = qNo + shares;
-  }
-
-  const newCost = calculateCost(newQYes, newQNo, b);
-
-  return newCost - currentCost;
+  const { normalizedOutcome, states } = ensureOutcomeExists(market, outcome);
+  const b = getEffectiveLiquidity(market);
+  const currentCost = calculateCost(states, b);
+  const updatedStates = applySharesDelta(states, normalizedOutcome, shares);
+  return calculateCost(updatedStates, b) - currentCost;
 }
 
-/**
- * Calculate slippage for a trade
- *
- * @param {Object} market - Market object
- * @param {string} outcome - 'YES' or 'NO'
- * @param {number} amount - Trade amount
- * @returns {Object} - { slippage, priceImpact, avgPrice }
- */
 function calculateSlippage(market, outcome, amount) {
+  const { normalizedOutcome } = ensureOutcomeExists(market, outcome);
   const pricesBefore = getPrices(market);
-  const entryPrice =
-    outcome === "YES" ? pricesBefore.yesPrice : pricesBefore.noPrice;
-
-  // Apply fee
+  const entryPrice = pricesBefore.outcomePrices[normalizedOutcome];
   const feeRate = market.feeRate || 0.02;
   const amountAfterFee = amount * (1 - feeRate);
-
-  // Calculate shares and new price
-  const result = calculateSharesForCost(market, outcome, amountAfterFee);
-
-  // Average price paid
+  const result = calculateSharesForCost(
+    market,
+    normalizedOutcome,
+    amountAfterFee,
+  );
   const avgPrice = amountAfterFee / result.shares;
-
-  // Slippage = (avgPrice - entryPrice) / entryPrice
   const slippage = Math.abs(avgPrice - entryPrice) / entryPrice;
-
-  // Price impact = (priceAfter - priceBefore) / priceBefore
   const priceImpact = Math.abs(result.priceAfter - entryPrice) / entryPrice;
 
   return {
@@ -196,287 +228,151 @@ function calculateSlippage(market, outcome, amount) {
   };
 }
 
-/**
- * Execute a BUY YES trade with all safety checks
- *
- * @param {Object} market - Market object
- * @param {number} amount - Amount to spend
- * @param {Object} options - { maxSlippage, userId }
- * @returns {Object} - Trade result
- */
+function validateTradeRequest(market, amount) {
+  if (market.resolved) {
+    throw new Error("MARKET_RESOLVED: Cannot trade in resolved market");
+  }
+
+  if (!market.isTradingActive) {
+    throw new Error("TRADING_PAUSED: Trading is currently paused");
+  }
+
+  if (amount < (market.minTradeAmount || 1)) {
+    throw new Error(
+      `MIN_TRADE: Minimum trade amount is ${market.minTradeAmount || 1}`,
+    );
+  }
+
+  if (amount > (market.maxTradeAmount || 10000)) {
+    throw new Error(
+      `MAX_TRADE: Maximum trade amount is ${market.maxTradeAmount || 10000}`,
+    );
+  }
+}
+
+function buyShares(market, outcome, amount, options = {}) {
+  const { maxSlippage = 0.1 } = options;
+  const { normalizedOutcome } = ensureOutcomeExists(market, outcome);
+  validateTradeRequest(market, amount);
+
+  const feeRate = market.feeRate || 0.02;
+  const fee = amount * feeRate;
+  const amountAfterFee = amount - fee;
+  const pricesBefore = getPrices(market);
+  const entryPrice = pricesBefore.outcomePrices[normalizedOutcome];
+  const result = calculateSharesForCost(
+    market,
+    normalizedOutcome,
+    amountAfterFee,
+  );
+  const avgPrice = amountAfterFee / result.shares;
+  const slippage = Math.abs(avgPrice - entryPrice) / entryPrice;
+
+  if (slippage > maxSlippage) {
+    throw new Error(
+      `SLIPPAGE_EXCEEDED: Slippage ${(slippage * 100).toFixed(2)}% exceeds maximum ${(maxSlippage * 100).toFixed(2)}%`,
+    );
+  }
+
+  const updatedStates = applyPoolDelta(
+    result.updatedStates,
+    normalizedOutcome,
+    amountAfterFee,
+  );
+
+  return {
+    success: true,
+    outcome: normalizedOutcome,
+    shares: result.shares,
+    amountSpent: amount,
+    amountAfterFee,
+    fee,
+    feeRate,
+    avgPrice,
+    entryPrice,
+    slippage,
+    pricesBefore,
+    pricesAfter: getPrices({ ...market, outcomeStates: updatedStates }),
+    marketUpdate: buildMarketUpdate(market, updatedStates),
+  };
+}
+
 function buyYes(market, amount, options = {}) {
-  const { maxSlippage = 0.1 } = options;
-
-  // Validate market state
-  if (market.resolved) {
-    throw new Error("MARKET_RESOLVED: Cannot trade in resolved market");
-  }
-
-  if (!market.isTradingActive) {
-    throw new Error("TRADING_PAUSED: Trading is currently paused");
-  }
-
-  // Validate amount
-  if (amount < (market.minTradeAmount || 1)) {
-    throw new Error(
-      `MIN_TRADE: Minimum trade amount is ${market.minTradeAmount || 1}`,
-    );
-  }
-
-  if (amount > (market.maxTradeAmount || 10000)) {
-    throw new Error(
-      `MAX_TRADE: Maximum trade amount is ${market.maxTradeAmount || 10000}`,
-    );
-  }
-
-  // Calculate fee
-  const feeRate = market.feeRate || 0.02;
-  const fee = amount * feeRate;
-  const amountAfterFee = amount - fee;
-
-  // Get current prices
-  const pricesBefore = getPrices(market);
-
-  // Calculate shares
-  const result = calculateSharesForCost(market, "YES", amountAfterFee);
-
-  // Calculate slippage
-  const avgPrice = amountAfterFee / result.shares;
-  const slippage =
-    Math.abs(avgPrice - pricesBefore.yesPrice) / pricesBefore.yesPrice;
-
-  // Check slippage limit
-  if (slippage > maxSlippage) {
-    throw new Error(
-      `SLIPPAGE_EXCEEDED: Slippage ${(slippage * 100).toFixed(2)}% exceeds maximum ${(maxSlippage * 100).toFixed(2)}%`,
-    );
-  }
-
-  // Check liquidity floor
-  const liquidityFloor = market.liquidityFloor || 100;
-  if (
-    market.noPool - result.shares < liquidityFloor &&
-    result.shares > market.noPool
-  ) {
-    throw new Error("LIQUIDITY_FLOOR: Trade would breach liquidity floor");
-  }
-
-  // Calculate new prices
-  const pricesAfter = getPrices({
-    qYes: result.newQYes,
-    qNo: result.newQNo,
-    b: market.b,
-  });
-
-  return {
-    success: true,
-    outcome: "YES",
-    shares: result.shares,
-    amountSpent: amount,
-    amountAfterFee,
-    fee,
-    feeRate,
-    avgPrice,
-    entryPrice: pricesBefore.yesPrice,
-    slippage,
-    pricesBefore,
-    pricesAfter,
-    marketUpdate: {
-      qYes: result.newQYes,
-      qNo: result.newQNo,
-      yesPool: market.yesPool + amountAfterFee,
-      totalFeesCollected: (market.totalFeesCollected || 0) + fee,
-      totalVolume: (market.totalVolume || 0) + amount,
-      totalTrades: (market.totalTrades || 0) + 1,
-    },
-  };
+  return buyShares(market, "YES", amount, options);
 }
 
-/**
- * Execute a BUY NO trade with all safety checks
- *
- * @param {Object} market - Market object
- * @param {number} amount - Amount to spend
- * @param {Object} options - { maxSlippage, userId }
- * @returns {Object} - Trade result
- */
 function buyNo(market, amount, options = {}) {
-  const { maxSlippage = 0.1 } = options;
-
-  // Validate market state
-  if (market.resolved) {
-    throw new Error("MARKET_RESOLVED: Cannot trade in resolved market");
-  }
-
-  if (!market.isTradingActive) {
-    throw new Error("TRADING_PAUSED: Trading is currently paused");
-  }
-
-  // Validate amount
-  if (amount < (market.minTradeAmount || 1)) {
-    throw new Error(
-      `MIN_TRADE: Minimum trade amount is ${market.minTradeAmount || 1}`,
-    );
-  }
-
-  if (amount > (market.maxTradeAmount || 10000)) {
-    throw new Error(
-      `MAX_TRADE: Maximum trade amount is ${market.maxTradeAmount || 10000}`,
-    );
-  }
-
-  // Calculate fee
-  const feeRate = market.feeRate || 0.02;
-  const fee = amount * feeRate;
-  const amountAfterFee = amount - fee;
-
-  // Get current prices
-  const pricesBefore = getPrices(market);
-
-  // Calculate shares
-  const result = calculateSharesForCost(market, "NO", amountAfterFee);
-
-  // Calculate slippage
-  const avgPrice = amountAfterFee / result.shares;
-  const slippage =
-    Math.abs(avgPrice - pricesBefore.noPrice) / pricesBefore.noPrice;
-
-  // Check slippage limit
-  if (slippage > maxSlippage) {
-    throw new Error(
-      `SLIPPAGE_EXCEEDED: Slippage ${(slippage * 100).toFixed(2)}% exceeds maximum ${(maxSlippage * 100).toFixed(2)}%`,
-    );
-  }
-
-  // Check liquidity floor
-  const liquidityFloor = market.liquidityFloor || 100;
-  if (
-    market.yesPool - result.shares < liquidityFloor &&
-    result.shares > market.yesPool
-  ) {
-    throw new Error("LIQUIDITY_FLOOR: Trade would breach liquidity floor");
-  }
-
-  // Calculate new prices
-  const pricesAfter = getPrices({
-    qYes: result.newQYes,
-    qNo: result.newQNo,
-    b: market.b,
-  });
-
-  return {
-    success: true,
-    outcome: "NO",
-    shares: result.shares,
-    amountSpent: amount,
-    amountAfterFee,
-    fee,
-    feeRate,
-    avgPrice,
-    entryPrice: pricesBefore.noPrice,
-    slippage,
-    pricesBefore,
-    pricesAfter,
-    marketUpdate: {
-      qYes: result.newQYes,
-      qNo: result.newQNo,
-      noPool: market.noPool + amountAfterFee,
-      totalFeesCollected: (market.totalFeesCollected || 0) + fee,
-      totalVolume: (market.totalVolume || 0) + amount,
-      totalTrades: (market.totalTrades || 0) + 1,
-    },
-  };
+  return buyShares(market, "NO", amount, options);
 }
 
-/**
- * Calculate sell proceeds (redeeming shares)
- *
- * @param {Object} market - Market object
- * @param {string} outcome - 'YES' or 'NO'
- * @param {number} shares - Shares to sell
- * @returns {Object} - Sell result
- */
 function sellShares(market, outcome, shares) {
-  const { qYes, qNo, b } = market;
+  const { normalizedOutcome, states, selected } = ensureOutcomeExists(
+    market,
+    outcome,
+  );
+  const b = getEffectiveLiquidity(market);
+  const sellAmount = Number(shares);
 
-  // Current cost
-  const currentCost = calculateCost(qYes, qNo, b);
-
-  // New quantities after selling
-  let newQYes = qYes;
-  let newQNo = qNo;
-
-  if (outcome === "YES") {
-    newQYes = Math.max(0, qYes - shares);
-  } else {
-    newQNo = Math.max(0, qNo - shares);
+  if (!Number.isFinite(sellAmount) || sellAmount <= 0) {
+    throw new Error("INVALID_SHARES: Shares must be a positive number");
   }
 
-  // New cost
-  const newCost = calculateCost(newQYes, newQNo, b);
+  if (sellAmount > selected.quantity) {
+    throw new Error(
+      "INSUFFICIENT_MARKET_SHARES: Cannot sell more shares than currently exist for this outcome",
+    );
+  }
 
-  // Proceeds = cost reduction (minus fees)
+  const currentCost = calculateCost(states, b);
+  const statesAfterSale = applySharesDelta(
+    states,
+    normalizedOutcome,
+    -sellAmount,
+  );
+  const newCost = calculateCost(statesAfterSale, b);
   const grossProceeds = currentCost - newCost;
   const feeRate = market.feeRate || 0.02;
   const fee = grossProceeds * feeRate;
   const netProceeds = grossProceeds - fee;
-
-  const pricesAfter = getPrices({ qYes: newQYes, qNo: newQNo, b });
+  const updatedStates = applyPoolDelta(
+    statesAfterSale,
+    normalizedOutcome,
+    -grossProceeds,
+  );
 
   return {
     success: true,
-    outcome,
-    shares,
+    outcome: normalizedOutcome,
+    shares: sellAmount,
     grossProceeds,
     fee,
     netProceeds,
-    pricesAfter,
-    marketUpdate: {
-      qYes: newQYes,
-      qNo: newQNo,
-    },
+    pricesAfter: getPrices({ ...market, outcomeStates: updatedStates }),
+    marketUpdate: buildMarketUpdate(market, updatedStates),
   };
 }
 
-/**
- * Calculate optimal liquidity parameter 'b' based on expected volume
- * Higher 'b' = more liquidity = less price slippage
- * Lower 'b' = less liquidity = more responsive prices
- *
- * @param {number} expectedVolume - Expected total trading volume
- * @param {number} volatilityFactor - Market volatility (0-1)
- * @returns {number} - Recommended 'b' parameter
- */
 function calculateOptimalB(expectedVolume, volatilityFactor = 0.5) {
-  // Base formula: b = expectedVolume * (0.1 to 0.5) based on volatility
-  // Higher volatility = higher b for more stability
   const multiplier = 0.1 + volatilityFactor * 0.4;
   return Math.max(10, Math.min(10000, expectedVolume * multiplier));
 }
 
-/**
- * Normalize external market liquidity to internal 'b' parameter
- * Used for Polymarket/Gamma integration
- *
- * @param {number} externalLiquidity - External market liquidity
- * @param {number} externalVolume - External market volume
- * @returns {number} - Normalized 'b' parameter
- */
 function normalizeExternalLiquidity(externalLiquidity, externalVolume) {
-  // Estimate b based on liquidity to volume ratio
   const ratio = externalLiquidity / Math.max(externalVolume, 1);
   return Math.max(50, Math.min(5000, ratio * 100));
 }
 
 module.exports = {
-  calculateCost,
-  getPrices,
-  calculateSharesForCost,
-  calculateCostForShares,
-  calculateSlippage,
-  buyYes,
   buyNo,
-  sellShares,
+  buyShares,
+  buyYes,
+  calculateCost,
+  calculateCostForShares,
   calculateOptimalB,
+  calculateSharesForCost,
+  calculateSlippage,
+  getOutcomePrices,
+  getPrices,
   normalizeExternalLiquidity,
+  sellShares,
 };

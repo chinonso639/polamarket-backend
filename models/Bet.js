@@ -26,8 +26,12 @@ const betSchema = new mongoose.Schema(
     // Position details
     outcome: {
       type: String,
-      enum: ["YES", "NO"],
       required: [true, "Outcome is required"],
+      trim: true,
+    },
+    outcomeLabel: {
+      type: String,
+      trim: true,
     },
     shares: {
       type: Number,
@@ -122,18 +126,18 @@ betSchema.virtual("currentValue").get(function () {
 betSchema.statics.getUserPosition = async function (userId, marketId) {
   const positions = await this.find({ userId, marketId, settled: false });
 
-  const result = {
-    YES: { shares: 0, amountSpent: 0, avgPrice: 0 },
-    NO: { shares: 0, amountSpent: 0, avgPrice: 0 },
-  };
+  const result = {};
 
   for (const pos of positions) {
+    if (!result[pos.outcome]) {
+      result[pos.outcome] = { shares: 0, amountSpent: 0, avgPrice: 0 };
+    }
     result[pos.outcome].shares += pos.shares;
     result[pos.outcome].amountSpent += pos.amountSpent;
   }
 
   // Calculate weighted average price
-  for (const outcome of ["YES", "NO"]) {
+  for (const outcome of Object.keys(result)) {
     if (result[outcome].shares > 0) {
       result[outcome].avgPrice =
         result[outcome].amountSpent / result[outcome].shares;
@@ -146,7 +150,10 @@ betSchema.statics.getUserPosition = async function (userId, marketId) {
 // Static method to get all user's active positions
 betSchema.statics.getUserActivePositions = async function (userId) {
   return this.find({ userId, settled: false })
-    .populate("marketId", "question outcome resolved yesPrice noPrice")
+    .populate(
+      "marketId",
+      "question outcome resolved yesPrice noPrice outcomeStates",
+    )
     .sort({ createdAt: -1 });
 };
 
@@ -169,20 +176,14 @@ betSchema.statics.getMarketPositionSummary = async function (marketId) {
     },
   ]);
 
-  return result.reduce(
-    (acc, item) => {
-      acc[item._id] = {
-        totalShares: item.totalShares,
-        totalAmount: item.totalAmount,
-        uniqueTraders: item.uniqueUsers.length,
-      };
-      return acc;
-    },
-    {
-      YES: { totalShares: 0, totalAmount: 0, uniqueTraders: 0 },
-      NO: { totalShares: 0, totalAmount: 0, uniqueTraders: 0 },
-    },
-  );
+  return result.reduce((acc, item) => {
+    acc[item._id] = {
+      totalShares: item.totalShares,
+      totalAmount: item.totalAmount,
+      uniqueTraders: item.uniqueUsers.length,
+    };
+    return acc;
+  }, {});
 };
 
 // Method to calculate payout for this bet

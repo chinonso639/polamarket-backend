@@ -6,6 +6,7 @@
 const User = require("../models/User");
 const Bet = require("../models/Bet");
 const Transaction = require("../models/Transaction");
+const { getPrices } = require("../amm/lmsr");
 const response = require("../utils/response");
 const logger = require("../utils/logger");
 const { asyncHandler } = require("../middleware/errorHandler");
@@ -97,7 +98,7 @@ const getPositions = asyncHandler(async (req, res) => {
   const positions = await Bet.find(query)
     .populate(
       "marketId",
-      "question category outcome resolved qYes qNo b endDate",
+      "question category outcome resolved qYes qNo b endDate outcomeStates",
     )
     .sort({ createdAt: -1 })
     .lean();
@@ -105,10 +106,8 @@ const getPositions = asyncHandler(async (req, res) => {
   // Add current value to each position
   const positionsWithValue = positions.map((pos) => {
     if (pos.marketId) {
-      const expYes = Math.exp(pos.marketId.qYes / pos.marketId.b);
-      const expNo = Math.exp(pos.marketId.qNo / pos.marketId.b);
-      const yesPrice = expYes / (expYes + expNo);
-      const currentPrice = pos.outcome === "YES" ? yesPrice : 1 - yesPrice;
+      const prices = getPrices(pos.marketId);
+      const currentPrice = prices.outcomePrices?.[pos.outcome] ?? 0;
 
       return {
         ...pos,

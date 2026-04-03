@@ -113,8 +113,8 @@ const transactionSchema = new mongoose.Schema(
     tradeDetails: {
       outcome: {
         type: String,
-        enum: ["YES", "NO"],
       },
+      outcomeLabel: String,
       shares: Number,
       pricePerShare: Number,
       slippage: Number,
