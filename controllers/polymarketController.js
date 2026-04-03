@@ -892,37 +892,67 @@ const getMarkets = asyncHandler(async (req, res) => {
 
 /**
  * GET /api/polymarket/trending
- * Fetch trending markets - fetches multiple batches to get variety across categories
+ * Fetch trending markets from Gamma events endpoint (better volume data)
  */
 const getTrendingMarkets = asyncHandler(async (req, res) => {
   const limit = parseInt(req.query.limit) || 100;
   const category = req.query.category;
 
-  // Fetch larger batch to ensure variety across categories
-  const batchSize = 100;
-  const batches = 3; // Fetch 300 markets total
+  // Use events endpoint - has real volume data vs fake/low-volume sports markets
   let allMarkets = [];
+  const now = new Date();
 
-  for (let i = 0; i < batches; i++) {
+  try {
+    // Fetch top events by volume
+    const eventsResponse = await gammaApi.get("/events", {
+      params: {
+        limit: 50,
+        order: "volume",
+        ascending: false,
+        active: true,
+        closed: false,
+      },
+    });
+
+    const events = Array.isArray(eventsResponse.data)
+      ? eventsResponse.data
+      : eventsResponse.data.events || [];
+
+    // Extract markets from events
+    for (const event of events) {
+      const eventMarkets = Array.isArray(event.markets) ? event.markets : [];
+      // Only take top markets per event to avoid flooding with one topic
+      const topEventMarkets = eventMarkets
+        .filter((m) => !m.closed && m.active !== false)
+        .slice(0, 3);
+      allMarkets = [...allMarkets, ...topEventMarkets];
+    }
+  } catch (error) {
+    logger.warn(`Failed to fetch events: ${error.message}`);
+  }
+
+  // Fallback: also fetch some from markets endpoint if needed
+  if (allMarkets.length < 50) {
     try {
-      const response_data = await gammaApi.get("/markets", {
+      const marketsResponse = await gammaApi.get("/markets", {
         params: {
-          limit: batchSize,
-          offset: i * batchSize,
+          limit: 100,
           active: true,
           closed: false,
-          order: "volume",
+          order: "liquidity",
           ascending: false,
         },
       });
-
-      const markets = Array.isArray(response_data.data)
-        ? response_data.data
-        : response_data.data.markets || response_data.data.data || [];
-
-      allMarkets = [...allMarkets, ...markets];
+      const fallbackMarkets = Array.isArray(marketsResponse.data)
+        ? marketsResponse.data
+        : marketsResponse.data.markets || [];
+      // Only add markets with meaningful volume
+      const validFallback = fallbackMarkets.filter(
+        (m) => parseFloat(m.volume || 0) > 10000,
+      );
+      allMarkets = [...allMarkets, ...validFallback];
     } catch (error) {
-      logger.warn(`Failed to fetch batch ${i}: ${error.message}`);
+      logger.warn(`Failed to fetch fallback markets: ${error.message}`);
     }
   }
 
@@ -936,6 +966,16 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
   });
 
   let transformed = allMarkets.map(transformMarket);
+
+  // Filter out resolved markets and markets with end dates in the past
+  transformed = transformed.filter((m) => {
+    if (m.resolved) return false;
+    if (m.endDate) {
+      const endDate = new Date(m.endDate);
+      if (endDate < now) return false;
+    }
+    return true;
+  });
 
   // Handle special filter types
   const specialFilters = ["Trending", "Breaking", "New"];
@@ -955,9 +995,9 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
     // Sort by recent activity (price changes, volume in last 24h)
     transformed.sort((a, b) => {
       const aScore =
-        Math.abs(a.priceChange24h || 0) * 100 + (a.volume24hr || 0) / 1000;
+        Math.abs(a.priceChange24h || 0) * 100 + (a.totalVolume || 0) / 10000;
       const bScore =
-        Math.abs(b.priceChange24h || 0) * 100 + (b.volume24hr || 0) / 1000;
+        Math.abs(b.priceChange24h || 0) * 100 + (b.totalVolume || 0) / 10000;
       return bScore - aScore;
     });
   } else {
