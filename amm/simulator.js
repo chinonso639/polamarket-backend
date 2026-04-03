@@ -408,7 +408,7 @@ function testHighVolume() {
 function runAllTests() {
   console.log("╔══════════════════════════════════════════════════════════╗");
   console.log("║          LMSR AMM STRESS TEST SIMULATOR                  ║");
-  console.log("║          Polygrid Prediction Market Engine               ║");
+  console.log("║         Polamarket Prediction Market Engine              ║");
   console.log("╚══════════════════════════════════════════════════════════╝");
 
   const tests = [

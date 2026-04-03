@@ -14,7 +14,7 @@
  * - Price: P(outcome) = exp(q_outcome / b) / Σ exp(q_i / b)
  * - Cost: C(q) = b * log(Σ exp(q_i / b))
  *
- * @author Polygrid Team
+ * @author Polamarket Team
  */
 
 /**

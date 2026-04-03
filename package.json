@@ -1,5 +1,5 @@
 {
-  "name": "polygrid-backend",
+  "name": "polamarket-backend",
   "version": "1.0.0",
   "description": "Production-ready prediction market backend with LMSR-based AMM engine",
   "main": "server.js",
@@ -38,6 +38,6 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "author": "Polygrid Team",
+  "author": "Polamarket Team",
   "license": "MIT"
 }

@@ -1,5 +1,5 @@
 /**
- * Polygrid Backend Server
+ * Polamarket Backend Server
  * Production-ready prediction market with LMSR-based AMM engine
  */
 
