@@ -113,7 +113,86 @@ const _nameMatch = (a = "", b = "") => {
 };
 
 const _liveScoreCache = new Map(); // key: slugPrefix → { data, ts }
-const SOFASCORE_HEADERS = { "User-Agent": "Mozilla/5.0" };
+const SOFASCORE_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "gzip, deflate, br",
+  Referer: "https://www.sofascore.com/",
+  Origin: "https://www.sofascore.com",
+  "sec-ch-ua":
+    '"Chromium";v="123", "Google Chrome";v="123", "Not:A-Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-site",
+};
+
+// ── API-Football fallback (used when Sofascore is blocked in production) ─────
+const _apifootballKey = process.env.APIFOOTBALL_KEY;
+const APIFOOTBALL_HEADERS = _apifootballKey
+  ? { "x-apisports-key": _apifootballKey }
+  : null;
+
+const _apifootballScoreCache = new Map(); // key: dateStr → { events, ts }
+
+const _fetchApifootballEvents = async (dateStr) => {
+  if (!APIFOOTBALL_HEADERS) return [];
+  const cached = _apifootballScoreCache.get(dateStr);
+  if (cached && Date.now() - cached.ts < 60_000) return cached.events;
+  try {
+    const [liveRes, schedRes] = await Promise.allSettled([
+      axios.get("https://v3.football.api-sports.io/fixtures?live=all", {
+        headers: APIFOOTBALL_HEADERS,
+        timeout: 8000,
+      }),
+      axios.get(`https://v3.football.api-sports.io/fixtures?date=${dateStr}`, {
+        headers: APIFOOTBALL_HEADERS,
+        timeout: 8000,
+      }),
+    ]);
+    const liveEvents =
+      liveRes.status === "fulfilled" ? liveRes.value.data?.response || [] : [];
+    const schedEvents =
+      schedRes.status === "fulfilled"
+        ? schedRes.value.data?.response || []
+        : [];
+    const liveIds = new Set(liveEvents.map((e) => e.fixture?.id));
+    const merged = [...liveEvents];
+    for (const e of schedEvents) {
+      if (!liveIds.has(e.fixture?.id)) merged.push(e);
+    }
+    _apifootballScoreCache.set(dateStr, { events: merged, ts: Date.now() });
+    return merged;
+  } catch {
+    return [];
+  }
+};
+
+const _normaliseApifootballEvent = (e) => {
+  const statusShort = e.fixture?.status?.short;
+  const elapsed = e.fixture?.status?.elapsed ?? null;
+  const LIVE_SHORTS = ["1H", "2H", "HT", "ET", "BT", "P"];
+  const ENDED_SHORTS = ["FT", "AET", "PEN"];
+  const normStatus = LIVE_SHORTS.includes(statusShort)
+    ? statusShort === "HT"
+      ? "HT"
+      : "LIVE"
+    : ENDED_SHORTS.includes(statusShort)
+      ? "FT"
+      : "NS";
+  return {
+    home: e.goals?.home ?? null,
+    away: e.goals?.away ?? null,
+    statusShort: normStatus,
+    statusLong: e.fixture?.status?.long || "",
+    elapsed,
+    homeTeamId: null,
+    awayTeamId: null,
+  };
+};
 
 const fetchLiveScore = async (slugPrefix, teamA, teamB, gameStartTimestamp) => {
   const now = Date.now();
@@ -142,8 +221,8 @@ const fetchLiveScore = async (slugPrefix, teamA, teamB, gameStartTimestamp) => {
   })();
   if (!dateStr) return null;
 
+  // ── Try Sofascore first ───────────────────────────────────────────────────
   try {
-    // Try live endpoint first (fastest, most accurate), fallback to scheduled for finished matches
     let events = [];
     try {
       const liveRes = await axios.get(
@@ -155,20 +234,17 @@ const fetchLiveScore = async (slugPrefix, teamA, teamB, gameStartTimestamp) => {
       /* ignore, fall through to scheduled */
     }
 
-    // Always also fetch scheduled events for the date (covers HT, FT, ended matches)
     const schedRes = await axios.get(
       `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${dateStr}`,
       { headers: SOFASCORE_HEADERS, timeout: 6000 },
     );
     const scheduled = schedRes.data?.events || [];
 
-    // Merge (live takes precedence over same event in scheduled)
     const liveIds = new Set(events.map((e) => e.id));
     for (const e of scheduled) {
       if (!liveIds.has(e.id)) events.push(e);
     }
 
-    // Find matching event by team names
     const match =
       events.find(
         (e) =>
@@ -222,10 +298,38 @@ const fetchLiveScore = async (slugPrefix, teamA, teamB, gameStartTimestamp) => {
 
     _liveScoreCache.set(slugPrefix, { data: score, ts: now });
     return score;
-  } catch (e) {
-    logger.warn("Sofascore fetch failed:", e.message);
-    return null;
+  } catch (sofaErr) {
+    logger.warn("Sofascore fetch failed:", sofaErr.message);
   }
+
+  // ── Fallback: API-Football ────────────────────────────────────────────────
+  if (APIFOOTBALL_HEADERS) {
+    try {
+      const afEvents = await _fetchApifootballEvents(dateStr);
+      const afMatch =
+        afEvents.find(
+          (e) =>
+            _nameMatch(e.teams?.home?.name, teamA) &&
+            _nameMatch(e.teams?.away?.name, teamB),
+        ) ||
+        afEvents.find(
+          (e) =>
+            _nameMatch(e.teams?.home?.name, teamA) ||
+            _nameMatch(e.teams?.away?.name, teamB),
+        );
+
+      if (afMatch) {
+        const score = _normaliseApifootballEvent(afMatch);
+        _liveScoreCache.set(slugPrefix, { data: score, ts: now });
+        return score;
+      }
+    } catch (afErr) {
+      logger.warn("API-Football fallback failed:", afErr.message);
+    }
+  }
+
+  _liveScoreCache.set(slugPrefix, { data: null, ts: now });
+  return null;
 };
 
 /**
