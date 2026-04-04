@@ -34,241 +34,120 @@ const clobApi = axios.create({
 const RECENT_TRADES_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Map category from tags/question
+ * Known primary category tags from Gamma (case-insensitive matching)
+ */
+const CATEGORY_TAG_MAP = {
+  sports: "Sports",
+  nba: "Sports",
+  nfl: "Sports",
+  mlb: "Sports",
+  nhl: "Sports",
+  soccer: "Sports",
+  football: "Sports",
+  basketball: "Sports",
+  baseball: "Sports",
+  tennis: "Sports",
+  golf: "Sports",
+  "champions league": "Sports",
+  "premier league": "Sports",
+  "world cup": "Sports",
+  epl: "Sports",
+  superbowl: "Sports",
+  "super bowl": "Sports",
+  ufc: "Sports",
+  boxing: "Sports",
+  f1: "Sports",
+  "formula 1": "Sports",
+
+  politics: "Politics",
+  trump: "Politics",
+  biden: "Politics",
+  "trump presidency": "Politics",
+  congress: "Politics",
+  senate: "Politics",
+
+  elections: "Elections",
+  election: "Elections",
+  "us election": "Elections",
+  "world elections": "Elections",
+  "global elections": "Elections",
+  primary: "Elections",
+  nominee: "Elections",
+
+  crypto: "Crypto",
+  bitcoin: "Crypto",
+  ethereum: "Crypto",
+  solana: "Crypto",
+  defi: "Crypto",
+
+  economy: "Economy",
+  "fed rates": "Economy",
+  inflation: "Economy",
+  recession: "Economy",
+  gdp: "Economy",
+  tariff: "Economy",
+
+  finance: "Finance",
+  stocks: "Finance",
+  "stock market": "Finance",
+
+  tech: "Tech",
+  ai: "Tech",
+  "artificial intelligence": "Tech",
+
+  iran: "Iran",
+
+  geopolitics: "Geopolitics",
+  war: "Geopolitics",
+  military: "Geopolitics",
+  nato: "Geopolitics",
+
+  esports: "Esports",
+  gaming: "Esports",
+
+  weather: "Weather",
+  climate: "Weather",
+
+  culture: "Culture",
+  entertainment: "Culture",
+  movies: "Culture",
+  music: "Culture",
+};
+
+/**
+ * Map category from tags (prioritizes Gamma event tags)
+ * @param {Array} tags - Array of tag objects from Gamma (with .label) or strings
+ * @param {string} question - Market question as fallback
  */
 const mapCategory = (tags = [], question = "") => {
-  const tagStr = (tags || []).join(" ").toLowerCase();
+  // Extract tag labels - handle both object tags (from Gamma) and string tags
+  const tagLabels = (tags || [])
+    .map((t) => (typeof t === "object" && t !== null ? t.label || t.slug : t))
+    .filter(Boolean)
+    .map((s) => String(s).toLowerCase());
+
+  // Check tag labels against known categories (priority order)
+  for (const label of tagLabels) {
+    if (CATEGORY_TAG_MAP[label]) {
+      return CATEGORY_TAG_MAP[label];
+    }
+  }
+
+  // Fallback: check if any tag label contains a known category keyword
+  for (const label of tagLabels) {
+    for (const [keyword, category] of Object.entries(CATEGORY_TAG_MAP)) {
+      if (label.includes(keyword)) {
+        return category;
+      }
+    }
+  }
+
+  // Last resort: text-based detection on question
   const questionLower = (question || "").toLowerCase();
-  const combined = `${tagStr} ${questionLower}`;
-
-  // Iran - specific geopolitical focus
-  if (
-    combined.includes("iran") ||
-    combined.includes("tehran") ||
-    combined.includes("khamenei") ||
-    combined.includes("persian")
-  ) {
-    return "Iran";
-  }
-
-  // Geopolitics - international relations, wars, conflicts
-  if (
-    combined.includes("geopolitic") ||
-    combined.includes("war") ||
-    combined.includes("military") ||
-    combined.includes("nato") ||
-    combined.includes("russia") ||
-    combined.includes("ukraine") ||
-    combined.includes("china") ||
-    combined.includes("taiwan") ||
-    combined.includes("north korea") ||
-    combined.includes("sanction") ||
-    combined.includes("invasion") ||
-    combined.includes("troops") ||
-    combined.includes("conflict") ||
-    combined.includes("missile") ||
-    combined.includes("nuclear") ||
-    combined.includes("diplomat")
-  ) {
-    return "Geopolitics";
-  }
-
-  // Elections - specifically election markets
-  if (
-    combined.includes("election") ||
-    combined.includes("vote") ||
-    combined.includes("ballot") ||
-    combined.includes("primary") ||
-    combined.includes("nominee") ||
-    combined.includes("campaign") ||
-    combined.includes("electoral")
-  ) {
-    return "Elections";
-  }
-
-  // Politics - general political topics
-  if (
-    combined.includes("politic") ||
-    combined.includes("trump") ||
-    combined.includes("biden") ||
-    combined.includes("president") ||
-    combined.includes("congress") ||
-    combined.includes("senate") ||
-    combined.includes("democrat") ||
-    combined.includes("republican") ||
-    combined.includes("governor") ||
-    combined.includes("poll") ||
-    combined.includes("cabinet") ||
-    combined.includes("legislation")
-  ) {
-    return "Politics";
-  }
-
-  // Esports
-  if (
-    combined.includes("esport") ||
-    combined.includes("league of legends") ||
-    combined.includes("dota") ||
-    combined.includes("csgo") ||
-    combined.includes("cs2") ||
-    combined.includes("valorant") ||
-    combined.includes("overwatch") ||
-    combined.includes("fortnite") ||
-    combined.includes("gaming tournament") ||
-    combined.includes("twitch") ||
-    combined.includes("streamer")
-  ) {
-    return "Esports";
-  }
-
-  // Weather
-  if (
-    combined.includes("weather") ||
-    combined.includes("temperature") ||
-    combined.includes("hurricane") ||
-    combined.includes("tornado") ||
-    combined.includes("storm") ||
-    combined.includes("climate") ||
-    combined.includes("rainfall") ||
-    combined.includes("snow") ||
-    combined.includes("heat wave") ||
-    combined.includes("forecast") ||
-    combined.includes("celsius") ||
-    combined.includes("fahrenheit")
-  ) {
-    return "Weather";
-  }
-
-  // Crypto
-  if (
-    combined.includes("crypto") ||
-    combined.includes("bitcoin") ||
-    combined.includes("ethereum") ||
-    combined.includes("btc") ||
-    combined.includes("eth") ||
-    combined.includes("solana") ||
-    combined.includes("sol ") ||
-    combined.includes("doge") ||
-    combined.includes("blockchain") ||
-    combined.includes("defi") ||
-    combined.includes("altcoin") ||
-    combined.includes("nft")
-  ) {
-    return "Crypto";
-  }
-
-  // Sports
-  if (
-    combined.includes("sport") ||
-    combined.includes("nba") ||
-    combined.includes("nfl") ||
-    combined.includes("mlb") ||
-    combined.includes("nhl") ||
-    combined.includes("championship") ||
-    combined.includes("world cup") ||
-    combined.includes("super bowl") ||
-    combined.includes("playoffs") ||
-    combined.includes("finals") ||
-    combined.includes("mvp") ||
-    combined.includes("olympics") ||
-    combined.includes("soccer") ||
-    combined.includes("football") ||
-    combined.includes("basketball") ||
-    combined.includes("baseball") ||
-    combined.includes("tennis") ||
-    combined.includes("golf") ||
-    combined.includes("ufc") ||
-    combined.includes("boxing") ||
-    combined.includes("f1") ||
-    combined.includes("formula 1") ||
-    combined.includes("premier league") ||
-    combined.includes("la liga") ||
-    combined.includes("champions league")
-  ) {
-    return "Sports";
-  }
-
-  // Tech
-  if (
-    combined.includes("tech") ||
-    combined.includes("ai") ||
-    combined.includes("artificial intelligence") ||
-    combined.includes("chatgpt") ||
-    combined.includes("openai") ||
-    combined.includes("apple") ||
-    combined.includes("google") ||
-    combined.includes("microsoft") ||
-    combined.includes("meta") ||
-    combined.includes("facebook") ||
-    combined.includes("amazon") ||
-    combined.includes("nvidia") ||
-    combined.includes("tesla") ||
-    combined.includes("spacex") ||
-    combined.includes("elon musk") ||
-    combined.includes("iphone") ||
-    combined.includes("android") ||
-    combined.includes("software") ||
-    combined.includes("startup")
-  ) {
-    return "Tech";
-  }
-
-  // Economy
-  if (
-    combined.includes("economy") ||
-    combined.includes("gdp") ||
-    combined.includes("recession") ||
-    combined.includes("inflation") ||
-    combined.includes("unemployment") ||
-    combined.includes("tariff") ||
-    combined.includes("trade war") ||
-    combined.includes("import") ||
-    combined.includes("export")
-  ) {
-    return "Economy";
-  }
-
-  // Finance
-  if (
-    combined.includes("financ") ||
-    combined.includes("fed") ||
-    combined.includes("interest rate") ||
-    combined.includes("stock") ||
-    combined.includes("s&p") ||
-    combined.includes("nasdaq") ||
-    combined.includes("dow jones") ||
-    combined.includes("market") ||
-    combined.includes("bank") ||
-    combined.includes("treasury") ||
-    combined.includes("bond") ||
-    combined.includes("oil") ||
-    combined.includes("gold") ||
-    combined.includes("commodity")
-  ) {
-    return "Finance";
-  }
-
-  // Culture/Entertainment
-  if (
-    combined.includes("culture") ||
-    combined.includes("movie") ||
-    combined.includes("oscar") ||
-    combined.includes("grammy") ||
-    combined.includes("emmy") ||
-    combined.includes("award") ||
-    combined.includes("celebrity") ||
-    combined.includes("music") ||
-    combined.includes("film") ||
-    combined.includes("television") ||
-    combined.includes("tv show") ||
-    combined.includes("netflix") ||
-    combined.includes("disney") ||
-    combined.includes("hollywood") ||
-    combined.includes("album") ||
-    combined.includes("concert") ||
-    combined.includes("viral")
-  ) {
-    return "Culture";
+  for (const [keyword, category] of Object.entries(CATEGORY_TAG_MAP)) {
+    if (questionLower.includes(keyword)) {
+      return category;
+    }
   }
 
   return "World";
@@ -522,6 +401,7 @@ const transformMarket = (market) => {
     imageUrl: market.image || market.icon || null,
     slug: market.slug || market.market_slug,
     groupItemTitle: market.groupItemTitle || null,
+    siblingCount: market.siblingCount || 0,
     eventId:
       market.eventId || market.events?.[0]?.id || market.event?.id || null,
     conditionId: market.conditionId || market.condition_id,
@@ -932,13 +812,24 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
       ? eventsResponse.data
       : eventsResponse.data.events || [];
 
-    // Extract all active markets from events
+    // Extract all active markets from events, inheriting event tags and sibling count
     for (const event of events) {
       const eventMarkets = Array.isArray(event.markets) ? event.markets : [];
+      const eventTags = Array.isArray(event.tags) ? event.tags : [];
       const activeEventMarkets = eventMarkets.filter(
         (m) => !m.closed && m.active !== false,
       );
-      allMarkets = [...allMarkets, ...activeEventMarkets];
+      const siblingCount = activeEventMarkets.length;
+      const marketsWithMeta = activeEventMarkets.map((m) => ({
+        ...m,
+        // Merge event tags with any market-specific tags
+        tags: [...eventTags, ...(m.tags || [])],
+        // Track how many sibling markets exist in the same event
+        siblingCount,
+        // Pass eventId so detail page can fetch siblings directly
+        eventId: event.id,
+      }));
+      allMarkets = [...allMarkets, ...marketsWithMeta];
     }
   } catch (error) {
     logger.warn(`Failed to fetch events: ${error.message}`);
@@ -1030,6 +921,7 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
  */
 const getMarketById = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const { eventId: eventIdFromQuery } = req.query;
 
   const tryFetchGammaById = async (candidateId) => {
     if (!candidateId) return null;
@@ -1141,11 +1033,12 @@ const getMarketById = asyncHandler(async (req, res) => {
 
   const transformed = transformMarket(gammaMarket);
 
-  if (transformed.eventId) {
+  // Use eventId from query param (passed from frontend) or from market data
+  const effectiveEventId = eventIdFromQuery || transformed.eventId;
+
+  if (effectiveEventId) {
     try {
-      const eventResponse = await gammaApi.get(
-        `/events/${transformed.eventId}`,
-      );
+      const eventResponse = await gammaApi.get(`/events/${effectiveEventId}`);
       const eventPayload = Array.isArray(eventResponse.data)
         ? eventResponse.data[0]
         : eventResponse.data;
@@ -1155,6 +1048,7 @@ const getMarketById = asyncHandler(async (req, res) => {
       );
       if (groupedContracts.length > 0) {
         transformed.groupContracts = groupedContracts;
+        transformed.eventId = effectiveEventId;
       }
     } catch (_error) {
       // Non-fatal. Some events may not expose grouped markets.
@@ -1204,7 +1098,7 @@ const getMarketById = asyncHandler(async (req, res) => {
     try {
       const eventsResponse = await gammaApi.get("/events", {
         params: {
-          limit: 100,
+          limit: 200,
           order: "volume",
           ascending: false,
           active: true,
