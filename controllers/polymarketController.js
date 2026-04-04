@@ -33,11 +33,205 @@ const clobApi = axios.create({
 
 const RECENT_TRADES_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+// ── TheSportsDB team badge cache ─────────────────────────────────────────────
+const _teamBadgeCache = new Map();
+
+/**
+ * Normalise a team name for TheSportsDB lookup:
+ * - Remove accents/diacritics
+ * - Strip common prefixes (FC, SK, AS, …)
+ * Returns an array of candidates to try in order.
+ */
+const _teamNameCandidates = (name = "") => {
+  const stripped = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // remove diacritics
+    .replace(/\s+/g, " ")
+    .trim();
+  const noPrefix = stripped
+    .replace(
+      /^(fc|fk|sk|sc|ac|as|rc|vfb|vfl|sv|bv|rb|1\.\s*fc|1\.\s*fk|1\.)\s+/i,
+      "",
+    )
+    .trim();
+  const candidates = Array.from(
+    new Set([name.trim(), stripped, noPrefix].filter(Boolean)),
+  );
+  return candidates;
+};
+
+const fetchTeamBadge = async (teamName) => {
+  if (!teamName) return null;
+  const cacheKey = teamName.toLowerCase().trim();
+  if (_teamBadgeCache.has(cacheKey)) return _teamBadgeCache.get(cacheKey);
+
+  const candidates = _teamNameCandidates(teamName);
+  let badge = null;
+  for (const candidate of candidates) {
+    try {
+      const r = await axios.get(
+        "https://www.thesportsdb.com/api/v1/json/3/searchteams.php",
+        { params: { t: candidate }, timeout: 5000 },
+      );
+      const team = r.data?.teams?.[0];
+      const found = team?.strBadge || team?.strLogo || null;
+      if (found) {
+        badge = found;
+        break;
+      }
+    } catch {
+      /* continue */
+    }
+  }
+  _teamBadgeCache.set(cacheKey, badge);
+  return badge;
+};
+
+// ── Sofascore live score + team logos ────────────────────────────────────────
+
+// Normalise a team name to bare words for fuzzy matching
+const _bareTeam = (name = "") =>
+  name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\b(fc|fk|sk|sc|ac|as|rc|sv|vfb|vfl|rb|1\.\s*fc|1\.)\b/g, "")
+    .replace(/[^a-z0-9 ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const _nameMatch = (a = "", b = "") => {
+  const ba = _bareTeam(a);
+  const bb = _bareTeam(b);
+  if (!ba || !bb) return false;
+  return (
+    ba === bb ||
+    ba.includes(bb) ||
+    bb.includes(ba) ||
+    ba.split(" ").some((w) => w.length > 3 && bb.includes(w))
+  );
+};
+
+const _liveScoreCache = new Map(); // key: slugPrefix → { data, ts }
+const SOFASCORE_HEADERS = { "User-Agent": "Mozilla/5.0" };
+
+const fetchLiveScore = async (slugPrefix, teamA, teamB, gameStartTimestamp) => {
+  const now = Date.now();
+  const kickoff = gameStartTimestamp
+    ? new Date(gameStartTimestamp).getTime()
+    : null;
+  if (!kickoff) return null;
+
+  // Only fetch from -15min before kickoff to +140min after
+  if (now < kickoff - 15 * 60 * 1000 || now > kickoff + 140 * 60 * 1000)
+    return null;
+
+  // Return cached result (valid for 60s)
+  const cached = _liveScoreCache.get(slugPrefix);
+  if (cached && now - cached.ts < 60_000) return cached.data;
+
+  // Extract date from slugPrefix e.g. "cze1-fvp-fkt-2026-04-04"
+  const dateStr = (() => {
+    const parts = slugPrefix.split("-");
+    for (let i = 0; i < parts.length; i++) {
+      if (/^20\d{2}$/.test(parts[i]) && i + 2 < parts.length) {
+        return `${parts[i]}-${parts[i + 1]}-${parts[i + 2]}`;
+      }
+    }
+    return null;
+  })();
+  if (!dateStr) return null;
+
+  try {
+    // Try live endpoint first (fastest, most accurate), fallback to scheduled for finished matches
+    let events = [];
+    try {
+      const liveRes = await axios.get(
+        "https://api.sofascore.com/api/v1/sport/football/events/live",
+        { headers: SOFASCORE_HEADERS, timeout: 6000 },
+      );
+      events = liveRes.data?.events || [];
+    } catch {
+      /* ignore, fall through to scheduled */
+    }
+
+    // Always also fetch scheduled events for the date (covers HT, FT, ended matches)
+    const schedRes = await axios.get(
+      `https://api.sofascore.com/api/v1/sport/football/scheduled-events/${dateStr}`,
+      { headers: SOFASCORE_HEADERS, timeout: 6000 },
+    );
+    const scheduled = schedRes.data?.events || [];
+
+    // Merge (live takes precedence over same event in scheduled)
+    const liveIds = new Set(events.map((e) => e.id));
+    for (const e of scheduled) {
+      if (!liveIds.has(e.id)) events.push(e);
+    }
+
+    // Find matching event by team names
+    const match =
+      events.find(
+        (e) =>
+          _nameMatch(e.homeTeam?.name, teamA) &&
+          _nameMatch(e.awayTeam?.name, teamB),
+      ) ||
+      events.find(
+        (e) =>
+          _nameMatch(e.homeTeam?.name, teamA) ||
+          _nameMatch(e.awayTeam?.name, teamB),
+      );
+
+    if (!match) {
+      _liveScoreCache.set(slugPrefix, { data: null, ts: now });
+      return null;
+    }
+
+    const statusDesc = match.status?.description || "";
+    const LIVE_STATUSES = [
+      "1st half",
+      "2nd half",
+      "Half Time",
+      "Extra Time",
+      "Extra time halftime",
+      "Penalties",
+    ];
+    const ENDED_STATUSES = ["Ended", "After extra time", "After penalties"];
+    const statusShort = LIVE_STATUSES.some((s) =>
+      statusDesc.toLowerCase().includes(s.toLowerCase()),
+    )
+      ? statusDesc.toLowerCase().includes("half time")
+        ? "HT"
+        : "LIVE"
+      : ENDED_STATUSES.some((s) =>
+            statusDesc.toLowerCase().includes(s.toLowerCase()),
+          )
+        ? "FT"
+        : "NS";
+
+    const elapsed = match.time?.played ?? null;
+
+    const score = {
+      home: match.homeScore?.current ?? null,
+      away: match.awayScore?.current ?? null,
+      statusShort,
+      statusLong: statusDesc,
+      elapsed,
+      homeTeamId: match.homeTeam?.id ?? null,
+      awayTeamId: match.awayTeam?.id ?? null,
+    };
+
+    _liveScoreCache.set(slugPrefix, { data: score, ts: now });
+    return score;
+  } catch (e) {
+    logger.warn("Sofascore fetch failed:", e.message);
+    return null;
+  }
+};
+
 /**
  * Known primary category tags from Gamma (case-insensitive matching)
  */
 const CATEGORY_TAG_MAP = {
-  sports: "Sports",
   nba: "Sports",
   nfl: "Sports",
   mlb: "Sports",
@@ -478,6 +672,8 @@ const SPORTS_KEYWORDS = [
   "ufc",
   "mma",
   "tennis",
+  "atp",
+  "wta",
   "champions league",
   "premier league",
   "f1",
@@ -488,6 +684,8 @@ const SPORTS_KEYWORDS = [
   "match",
   "game",
   "vs",
+  "fight",
+  "hockey",
 ];
 
 const extractTagText = (tags = []) =>
@@ -499,11 +697,163 @@ const extractTagText = (tags = []) =>
     })
     .join(" ");
 
+// Gamma slug prefix → soccer league name
+const SOCCER_SLUG_PREFIX_MAP = {
+  bun: "Bundesliga",
+  bl2: "2. Bundesliga",
+  bl3: "3. Liga",
+  sea: "Serie A",
+  itsb: "Serie B",
+  lal: "La Liga",
+  es2: "La Liga 2",
+  elc: "Championship",
+  efa: "Championship",
+  eng1: "Championship",
+  spl: "Saudi Pro League",
+  fl1: "Ligue 1",
+  fl2: "Ligue 2",
+  tur: "Super Lig",
+  isp: "ISL",
+  ind1: "ISL",
+  bra1: "Brasileirão",
+  bra2: "Brasileirão Série B",
+  nor: "Eliteserien",
+  ere: "Eredivisie",
+  por: "Liga Portugal",
+  por2: "Liga Portugal 2",
+  cze1: "Czech First League",
+  svk1: "Slovak Super Liga",
+  den: "Danish Superliga",
+  kor: "K League",
+  mar1: "Botola Pro",
+  col: "Conference League",
+  col1: "Copa Colombia",
+  arg1: "Liga Profesional",
+  arg2: "Primera Nacional",
+  scop: "Scottish Premiership",
+  sco1: "Scottish Premiership",
+  rus: "Russian Premier League",
+  rus1: "Russian Premier League",
+  sud: "Copa Sudamericana",
+  j1100: "J-League",
+  j1: "J-League",
+  jpn1: "J-League",
+  mls: "MLS",
+  mlsmls: "MLS",
+  ucl: "Champions League",
+  uel: "Europa League",
+  uecl: "Conference League",
+  afl: "Australian A-League",
+  gre1: "Super League Greece",
+  bel1: "Pro League Belgium",
+  sco2: "Scottish Championship",
+  wal1: "Cymru Premier",
+  nig1: "NPFL Nigeria",
+  egy1: "Egyptian Premier League",
+  rsa1: "PSL South Africa",
+  mex1: "Liga MX",
+  mex2: "Ascenso MX",
+  chi1: "Primera División Chile",
+  uru1: "Primera División Uruguay",
+  per1: "Liga 1 Peru",
+  ecu1: "LigaPro Ecuador",
+  ven1: "Primera División Venezuela",
+  bol1: "División de Fútbol Bolivia",
+  par1: "División de Honor Paraguay",
+  con: "CONCACAF League",
+  caf: "CAF Champions League",
+};
+
+// Slug prefixes that are NOT soccer (basketball, esports, cricket, baseball etc.)
+// Do NOT add nba/nhl/nfl/ufc/tennis here — those need to reach the sports board
+const NON_SOCCER_SLUG_PREFIXES = new Set([
+  "bkcba",
+  "bkarg",
+  "bkeur",
+  "bkrus",
+  "bknba",
+  "bkusa",
+  "bktur",
+  "bktbr",
+  "bkbra",
+  "cbb",
+  "euroleague", // non-NBA basketball leagues
+  "lol",
+  "mlbb",
+  "ow",
+  "r6siege",
+  "val",
+  "dota",
+  "pubg",
+  "cs2",
+  "rl",
+  "apexl",
+  "rocketleague",
+  "smite",
+  "sc2",
+  "halo", // esports
+  "chess",
+  "checkers", // chess
+  "criclcl",
+  "crint",
+  "cricp",
+  "cri",
+  "ipl", // cricket
+  "mlb",
+  "kbo",
+  "npb", // baseball
+  "f1",
+  "nascar", // motorsport
+  // NOTE: nhl, nfl, ufc, nba, tennis, atp, wta are intentionally NOT here —
+  // they need to pass through parseMatchFromMarket so they appear on the sports board
+]);
+
+const detectSoccerLeague = (market = {}) => {
+  const question = market.question || market.title || "";
+  const tagText = extractTagText(market.tags);
+  const slug = market.slug || market.market_slug || "";
+  const t = `${question} ${tagText} ${slug}`.toLowerCase();
+  const slugPrefix = slug.split("-")[0].toLowerCase();
+
+  // Slug-prefix detection is most reliable (Gamma encodes the league in the prefix)
+  if (SOCCER_SLUG_PREFIX_MAP[slugPrefix])
+    return SOCCER_SLUG_PREFIX_MAP[slugPrefix];
+
+  // Keyword fallback
+  if (t.includes("premier league") || t.includes(" epl "))
+    return "Premier League";
+  if (t.includes("la liga") || t.includes("laliga")) return "La Liga";
+  if (t.includes("serie a")) return "Serie A";
+  if (t.includes("bundesliga")) return "Bundesliga";
+  if (t.includes("ligue 1") || t.includes("ligue1")) return "Ligue 1";
+  if (t.includes("eredivisie")) return "Eredivisie";
+  if (t.includes("liga portugal") || t.includes("primeira liga"))
+    return "Liga Portugal";
+  if (t.includes("super lig") || t.includes("süper lig")) return "Super Lig";
+  if (t.includes("scottish premiership") || t.includes("spfl"))
+    return "Scottish Premiership";
+  if (t.includes(" mls ") || t.includes("major league soccer")) return "MLS";
+  if (t.includes("copa libertadores") || t.includes("libertadores"))
+    return "Copa Libertadores";
+  if (t.includes("champions league") || t.includes(" ucl "))
+    return "Champions League";
+  if (t.includes("europa league")) return "Europa League";
+  if (t.includes("conference league")) return "Conference League";
+  if (t.includes("fa cup")) return "FA Cup";
+  if (t.includes("copa del rey")) return "Copa del Rey";
+  if (t.includes("saudi pro league") || t.includes("saudi league"))
+    return "Saudi Pro League";
+  if (t.includes("brasileirão") || t.includes("serie b brazil"))
+    return "Brasileirão";
+  return null;
+};
+
 const detectSportsLeague = (market = {}) => {
   const question = market.question || market.title || "";
   const tagText = extractTagText(market.tags);
   const slug = market.slug || market.market_slug || "";
   const t = `${question} ${tagText} ${slug}`.toLowerCase();
+  const slugPrefix = slug.split("-")[0].toLowerCase();
 
   if (
     slug.startsWith("nba-") ||
@@ -560,8 +910,14 @@ const detectSportsLeague = (market = {}) => {
     return "Tennis";
   }
 
+  // Known non-soccer slug prefixes: return null so parseMatchFromMarket can filter them out
+  if (NON_SOCCER_SLUG_PREFIXES.has(slugPrefix)) return null;
+
+  // Known soccer slug prefixes
+  if (SOCCER_SLUG_PREFIX_MAP[slugPrefix]) return "Soccer";
+
   // Soccer-heavy slugs often use 3-letter league + team codes (e.g. por-spo-cds)
-  if (/^[a-z]{3}-[a-z0-9]{2,5}-[a-z0-9]{2,5}/.test(slug)) {
+  if (/^[a-z]{3,5}-[a-z0-9]{2,5}-[a-z0-9]{2,5}/.test(slug)) {
     return "Soccer";
   }
 
@@ -598,14 +954,25 @@ const parseMatchFromMarket = (market) => {
   const question = market.question || market.title || "";
   const combined = `${question} ${extractTagText(market.tags)} ${market.slug || ""}`;
   const lower = combined.toLowerCase();
+  const slugPrefix = (market.slug || "").split("-")[0].toLowerCase();
 
-  // Skip esports-style matches for this traditional sports board
+  // Skip known non-sports-board slugs (esports, basketball, cricket, baseball, chess…)
+  if (NON_SOCCER_SLUG_PREFIXES.has(slugPrefix)) return null;
+
+  // Skip esports by question keywords
   if (
     lower.includes("counter-strike") ||
     lower.includes("cs2") ||
     lower.includes("valorant") ||
     lower.includes("league of legends") ||
-    lower.includes("dota")
+    lower.includes("dota") ||
+    lower.includes("overwatch") ||
+    lower.includes("rainbow six") ||
+    lower.includes("mobile legends") ||
+    lower.includes("pubg") ||
+    lower.includes("rocket league") ||
+    lower.includes("lol:") ||
+    lower.includes("mlbb:")
   ) {
     return null;
   }
@@ -672,12 +1039,43 @@ const parseMatchFromMarket = (market) => {
   const marketId = market.id || market.condition_id || market.conditionId;
   const slug = market.slug || market.market_slug;
 
+  const endDateRaw =
+    market.endDate || market.end_date_iso || market.accepting_orders_timestamp;
+  const endMs = endDateRaw ? new Date(endDateRaw).getTime() : null;
+  const now = Date.now();
+  const hoursUntilEnd = endMs ? (endMs - now) / 3600000 : null;
+
+  // Skip markets resolving more than 7 days from now — too far to be "sports"
+  if (hoursUntilEnd !== null && hoursUntilEnd > 168) return null;
+
+  // isLive: market resolves within 12 hours — match is today or in progress
+  const isLive =
+    hoursUntilEnd !== null && hoursUntilEnd >= -2 && hoursUntilEnd <= 12;
+
+  // matchStatus: finer label shown in the UI
+  let matchStatus;
+  if (hoursUntilEnd === null) {
+    matchStatus = "upcoming";
+  } else if (hoursUntilEnd < -2) {
+    matchStatus = "ended";
+  } else if (hoursUntilEnd <= 3) {
+    matchStatus = "live";
+  } else if (hoursUntilEnd <= 12) {
+    matchStatus = "today";
+  } else {
+    matchStatus = "upcoming";
+  }
+
+  const detectedLeague = detectSportsLeague(market);
+
   return {
     id: marketId,
     marketId,
     slug,
     question,
-    league: detectSportsLeague(market),
+    league: detectedLeague,
+    soccerLeague:
+      detectedLeague === "Soccer" ? detectSoccerLeague(market) : null,
     marketType,
     teamA,
     teamB,
@@ -686,11 +1084,9 @@ const parseMatchFromMarket = (market) => {
     totalVolume: Number(market.volume || market.volumeNum || 0),
     liquidity: Number(market.liquidity || market.liquidityNum || 0),
     imageUrl: market.image || market.icon || null,
-    startTime:
-      market.endDate ||
-      market.end_date_iso ||
-      market.accepting_orders_timestamp,
-    isLive: true,
+    startTime: endDateRaw,
+    isLive,
+    matchStatus,
   };
 };
 
@@ -797,11 +1193,15 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
   let allMarkets = [];
   const now = new Date();
 
+  // Rotation factor - changes every 10 minutes to show different markets
+  // This ensures users see variety even with the same top volume markets
+  const rotationIndex = Math.floor(Date.now() / (10 * 60 * 1000)) % 15;
+
   try {
-    // Fetch top events by volume
+    // Fetch more events to get variety across categories
     const eventsResponse = await gammaApi.get("/events", {
       params: {
-        limit: 50,
+        limit: 200,
         order: "volume",
         ascending: false,
         active: true,
@@ -908,7 +1308,7 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
       );
     });
 
-    // Pick newest from each category, then fill remaining
+    // Pick from each category with rotation for variety
     const diverse = [];
     const used = new Set();
     const categories = Object.keys(byCategory).sort(
@@ -917,9 +1317,11 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
         new Date(byCategory[a][0]?.createdAt || 0),
     );
 
-    // First pass: one from each category
+    // First pass: one from each category (with rotation offset)
     for (const cat of categories) {
-      const market = byCategory[cat][0];
+      const catMarkets = byCategory[cat];
+      const offset = rotationIndex % Math.max(1, catMarkets.length);
+      const market = catMarkets[offset] || catMarkets[0];
       if (market && !used.has(market._id)) {
         diverse.push(market);
         used.add(market._id);
@@ -951,7 +1353,7 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
       );
     });
 
-    // Pick top market from each category, then fill with remaining by price change
+    // Pick from each category with rotation for variety
     const diverse = [];
     const used = new Set();
     const categories = Object.keys(byCategory).sort(
@@ -960,9 +1362,11 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
         Math.abs(byCategory[a][0]?.priceChange24h || 0),
     );
 
-    // First pass: one from each category
+    // First pass: one from each category (with rotation offset)
     for (const cat of categories) {
-      const market = byCategory[cat][0];
+      const catMarkets = byCategory[cat];
+      const offset = rotationIndex % Math.max(1, catMarkets.length);
+      const market = catMarkets[offset] || catMarkets[0];
       if (market && !used.has(market._id)) {
         diverse.push(market);
         used.add(market._id);
@@ -979,9 +1383,68 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
     diverse.push(...remaining);
 
     transformed = diverse;
+  } else if (category === "Trending" || !category || category === "All") {
+    // Trending/All: Pick diverse markets across categories with rotation
+    const byCategory = {};
+    transformed.forEach((m) => {
+      const cat = m.category || "Other";
+      if (!byCategory[cat]) byCategory[cat] = [];
+      byCategory[cat].push(m);
+    });
+
+    // Sort each category by volume
+    Object.values(byCategory).forEach((arr) => {
+      arr.sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0));
+    });
+
+    const diverse = [];
+    const used = new Set();
+    const categories = Object.keys(byCategory).sort(
+      (a, b) =>
+        (byCategory[b][0]?.totalVolume || 0) -
+        (byCategory[a][0]?.totalVolume || 0),
+    );
+
+    // First pass: pick 2 from each category (with rotation offset)
+    for (const cat of categories) {
+      const catMarkets = byCategory[cat];
+      const offset = rotationIndex % Math.max(1, catMarkets.length);
+      // Pick up to 2 markets per category, rotated
+      for (let i = 0; i < Math.min(2, catMarkets.length); i++) {
+        const idx = (offset + i) % catMarkets.length;
+        const market = catMarkets[idx];
+        if (market && !used.has(market._id)) {
+          diverse.push(market);
+          used.add(market._id);
+        }
+      }
+    }
+
+    // Second pass: fill remaining by volume
+    const remaining = transformed
+      .filter((m) => !used.has(m._id))
+      .sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0));
+    diverse.push(...remaining);
+
+    transformed = diverse;
   } else {
-    // Default: Sort by volume (Trending and All)
+    // Specific category sort: by volume with rotation
     transformed.sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0));
+
+    // Apply rotation offset so users see different markets each period
+    if (transformed.length > 10 && rotationIndex > 0) {
+      const offset = (rotationIndex * 3) % Math.min(40, transformed.length);
+      if (offset > 0) {
+        // Keep top 5 fixed, rotate the rest
+        const top5 = transformed.slice(0, 5);
+        const rest = transformed.slice(5);
+        transformed = [
+          ...top5,
+          ...rest.slice(offset),
+          ...rest.slice(0, offset),
+        ];
+      }
+    }
   }
 
   const sliced = transformed.slice(0, limit);
@@ -1211,6 +1674,244 @@ const getMarketById = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /api/polymarket/sports/match
+ * Fetch all prediction markets for a specific sports match, grouped by type.
+ * Accepts ?slugPrefix=bun-fre-bay-2026-04-04 to identify the match.
+ */
+const getSportsMatch = asyncHandler(async (req, res) => {
+  const { slugPrefix } = req.query;
+  if (!slugPrefix) {
+    return response.error(res, "slugPrefix query param is required", 400);
+  }
+
+  // Fetch multiple batches to find all markets sharing this slug prefix
+  const batchSize = 200;
+  const batches = 8;
+  let allMarkets = [];
+
+  for (let i = 0; i < batches; i++) {
+    try {
+      const result = await gammaApi.get("/markets", {
+        params: {
+          limit: batchSize,
+          offset: i * batchSize,
+          active: true,
+          closed: false,
+          order: "volume",
+          ascending: false,
+        },
+      });
+      const batch = Array.isArray(result.data)
+        ? result.data
+        : result.data?.markets || result.data?.data || [];
+      allMarkets = [...allMarkets, ...batch];
+    } catch (_e) {
+      // continue
+    }
+  }
+
+  // Filter to this match's slug prefix
+  const matchMarkets = allMarkets.filter(
+    (m) => m.slug && m.slug.startsWith(slugPrefix),
+  );
+
+  if (matchMarkets.length === 0) {
+    return response.success(res, { slugPrefix, groups: [] });
+  }
+
+  // Extract team names and metadata from the moneyline market (most informative)
+  const moneylineMarket =
+    matchMarkets.find((m) => m.sportsMarketType === "moneyline") ||
+    matchMarkets[0];
+
+  // Best team names: try to parse from "Team A vs Team B" in the question
+  const extractTeamsFromQuestion = (question = "") => {
+    const cleaned = question
+      .replace(/^Will\s+/i, "")
+      .replace(/\?.*$/, "")
+      .trim();
+    const vsMatch = cleaned.match(/^(.+?)\s+vs\.?\s+(.+?)(\s*(?:end|:)|$)/i);
+    if (vsMatch) {
+      return { teamA: vsMatch[1].trim(), teamB: vsMatch[2].trim() };
+    }
+    return { teamA: null, teamB: null };
+  };
+
+  // Find the best market for team name extraction: prefer moneyline with vs pattern
+  const bestForNames =
+    matchMarkets.find((m) => {
+      const { teamA } = extractTeamsFromQuestion(m.question);
+      return !!teamA;
+    }) || moneylineMarket;
+
+  const parseOutcomePrices = (m) => {
+    try {
+      return JSON.parse(m.outcomePrices || "[]").map(Number);
+    } catch {
+      return [];
+    }
+  };
+
+  const parseOutcomes = (m) => {
+    try {
+      return JSON.parse(m.outcomes || "[]");
+    } catch {
+      return [];
+    }
+  };
+
+  const formatMoney = (v) => {
+    const n = Number(v || 0);
+    if (n >= 1000000) return `$${(n / 1000000).toFixed(1)}M`;
+    if (n >= 1000) return `$${(n / 1000).toFixed(0)}K`;
+    return `$${n.toFixed(0)}`;
+  };
+
+  // Group markets by their sportsMarketType category
+  const SECTION_ORDER = [
+    "moneyline",
+    "spreads",
+    "totals",
+    "both_teams_to_score",
+    "soccer_exact_score",
+    "soccer_halftime_result",
+    "soccer_anytime_goalscorer",
+  ];
+
+  const SECTION_LABELS = {
+    moneyline: "Moneyline",
+    spreads: "Spreads",
+    totals: "Totals",
+    both_teams_to_score: "Both Teams to Score?",
+    soccer_exact_score: "Exact Score",
+    soccer_halftime_result: "Halftime Result",
+    soccer_anytime_goalscorer: "Goalscorers",
+  };
+
+  const sectionMap = {};
+  for (const m of matchMarkets) {
+    const type = m.sportsMarketType || "other";
+    if (!sectionMap[type]) sectionMap[type] = [];
+    const prices = parseOutcomePrices(m);
+    const outcomes = parseOutcomes(m);
+    sectionMap[type].push({
+      id: m.id,
+      slug: m.slug,
+      question: m.question,
+      sportsMarketType: type,
+      line: m.line,
+      volume: formatMoney(m.volumeNum || m.volume),
+      volumeRaw: Number(m.volumeNum || m.volume || 0),
+      outcomes: outcomes.map((label, idx) => ({
+        label,
+        price: prices[idx] ?? 0.5,
+        pricePct: Math.round((prices[idx] ?? 0.5) * 100),
+      })),
+    });
+  }
+
+  // Build ordered groups
+  const groups = [];
+  for (const type of SECTION_ORDER) {
+    if (sectionMap[type]) {
+      // Sort within section by line (numeric) then volume
+      const sorted = sectionMap[type].sort(
+        (a, b) =>
+          (Number(a.line) || 0) - (Number(b.line) || 0) ||
+          b.volumeRaw - a.volumeRaw,
+      );
+      const totalVol = formatMoney(
+        sectionMap[type].reduce((s, m) => s + m.volumeRaw, 0),
+      );
+      groups.push({
+        type,
+        label: SECTION_LABELS[type] || type,
+        volume: totalVol,
+        markets: sorted,
+      });
+    }
+  }
+  // Append any unknown types at the end
+  for (const [type, mkts] of Object.entries(sectionMap)) {
+    if (!SECTION_ORDER.includes(type)) {
+      groups.push({
+        type,
+        label: type.replace(/_/g, " "),
+        volume: formatMoney(mkts.reduce((s, m) => s + m.volumeRaw, 0)),
+        markets: mkts,
+      });
+    }
+  }
+
+  // Get match metadata — prefer names from question text (handles binary Yes/No markets)
+  const { teamA: parsedA, teamB: parsedB } = extractTeamsFromQuestion(
+    bestForNames?.question || "",
+  );
+  const teamOutcomes = parseOutcomes(moneylineMarket);
+  const teamPrices = parseOutcomePrices(moneylineMarket);
+  const isBinary =
+    teamOutcomes.length === 2 &&
+    ["yes", "no"].includes((teamOutcomes[0] || "").toLowerCase());
+
+  const teamA = parsedA || (!isBinary ? teamOutcomes[0] : null) || null;
+  const teamB =
+    parsedB ||
+    (!isBinary ? teamOutcomes[teamOutcomes.length - 1] : null) ||
+    null;
+
+  // For moneyline markets the raw outcomes give correct prices; for binary they don't
+  const priceA = isBinary ? null : (teamPrices[0] ?? null);
+  const priceB = isBinary ? null : (teamPrices[teamPrices.length - 1] ?? null);
+
+  // Fetch match image, live score, and team badges in parallel
+  const GENERIC_SOCCER_BALL = "soccer ball";
+  const rawImage = moneylineMarket.image || moneylineMarket.icon || "";
+  const matchImage = rawImage.toLowerCase().includes(GENERIC_SOCCER_BALL)
+    ? null
+    : rawImage || null;
+
+  const gameStartTime = moneylineMarket.gameStartTime;
+
+  // Fetch live score first so we can use Sofascore team IDs for logos
+  const liveScore = await fetchLiveScore(
+    slugPrefix,
+    teamA,
+    teamB,
+    gameStartTime,
+  );
+
+  // Prefer Sofascore logos (faster CDN, no rate limits); fallback to TheSportsDB
+  const sofascoreLogoUrl = (id) =>
+    id ? `https://api.sofascore.app/api/v1/team/${id}/image` : null;
+
+  const [teamAIcon, teamBIcon] = await Promise.all([
+    liveScore?.homeTeamId
+      ? Promise.resolve(sofascoreLogoUrl(liveScore.homeTeamId))
+      : fetchTeamBadge(teamA),
+    liveScore?.awayTeamId
+      ? Promise.resolve(sofascoreLogoUrl(liveScore.awayTeamId))
+      : fetchTeamBadge(teamB),
+  ]);
+
+  return response.success(res, {
+    slugPrefix,
+    teamA,
+    teamB,
+    teamAIcon,
+    teamBIcon,
+    matchImage,
+    priceA,
+    priceB,
+    gameStartTime,
+    liveScore, // { home, away, statusShort, statusLong, elapsed, homeTeamId, awayTeamId } or null
+    league:
+      detectSoccerLeague(moneylineMarket) ||
+      detectSportsLeague(moneylineMarket),
+    groups,
+  });
+});
+
+/**
  * GET /api/polymarket/search
  * Search markets
  */
@@ -1355,6 +2056,7 @@ module.exports = {
   getMarkets,
   getTrendingMarkets,
   getLiveSportsMatches,
+  getSportsMatch,
   getMarketById,
   searchMarkets,
   getCategories,
