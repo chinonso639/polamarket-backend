@@ -76,6 +76,20 @@ function initializeSocketIO(httpServer) {
       socket.leave("markets:all");
     });
 
+    // Subscribe to category updates
+    socket.on("subscribe:category", (category) => {
+      socket.join(`category:${category}`);
+      logger.debug(`Socket ${socket.id} subscribed to category:${category}`);
+    });
+
+    // Unsubscribe from category
+    socket.on("unsubscribe:category", (category) => {
+      socket.leave(`category:${category}`);
+      logger.debug(
+        `Socket ${socket.id} unsubscribed from category:${category}`,
+      );
+    });
+
     // Subscribe to user updates (requires auth)
     socket.on("subscribe:user", () => {
       if (socket.userId) {
@@ -124,21 +138,24 @@ function getIO() {
  * @param {string} marketId - Market ID
  * @param {Object} prices - { yesPrice, noPrice }
  */
-function emitPriceUpdate(marketId, prices) {
+function emitPriceUpdate(marketId, prices, category = null) {
   if (!io) return;
 
-  io.to(`market:${marketId}`).emit("priceUpdate", {
+  const payload = {
     marketId,
     ...prices,
     timestamp: new Date(),
-  });
+  };
+
+  io.to(`market:${marketId}`).emit("priceUpdate", payload);
 
   // Also emit to all markets room
-  io.to("markets:all").emit("priceUpdate", {
-    marketId,
-    ...prices,
-    timestamp: new Date(),
-  });
+  io.to("markets:all").emit("priceUpdate", payload);
+
+  // Emit to category room if specified
+  if (category) {
+    io.to(`category:${category}`).emit("priceUpdate", payload);
+  }
 }
 
 /**

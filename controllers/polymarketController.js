@@ -66,13 +66,13 @@ const CATEGORY_TAG_MAP = {
   congress: "Politics",
   senate: "Politics",
 
-  elections: "Elections",
-  election: "Elections",
-  "us election": "Elections",
-  "world elections": "Elections",
-  "global elections": "Elections",
-  primary: "Elections",
-  nominee: "Elections",
+  elections: "Politics",
+  election: "Politics",
+  "us election": "Politics",
+  "world elections": "Politics",
+  "global elections": "Politics",
+  primary: "Politics",
+  nominee: "Politics",
 
   crypto: "Crypto",
   bitcoin: "Crypto",
@@ -408,6 +408,7 @@ const transformMarket = (market) => {
     resolved: market.closed || market.resolved || false,
     outcome: market.outcome || null,
     tags: market.tags || [],
+    createdAt: market.createdAt || market.created_at || null,
   };
 };
 
@@ -891,19 +892,93 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
 
   // Sort based on filter type
   if (category === "New") {
-    // Sort by creation date (newest first)
-    transformed.sort(
-      (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0),
-    );
-  } else if (category === "Breaking") {
-    // Sort by recent activity (price changes, volume in last 24h)
-    transformed.sort((a, b) => {
-      const aScore =
-        Math.abs(a.priceChange24h || 0) * 100 + (a.totalVolume || 0) / 10000;
-      const bScore =
-        Math.abs(b.priceChange24h || 0) * 100 + (b.totalVolume || 0) / 10000;
-      return bScore - aScore;
+    // New: Diverse markets sorted by creation date
+    // Ensure variety by picking newest from each category
+    const byCategory = {};
+    transformed.forEach((m) => {
+      const cat = m.category || "Other";
+      if (!byCategory[cat]) byCategory[cat] = [];
+      byCategory[cat].push(m);
     });
+
+    // Sort each category by creation date (newest first)
+    Object.values(byCategory).forEach((arr) => {
+      arr.sort(
+        (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0),
+      );
+    });
+
+    // Pick newest from each category, then fill remaining
+    const diverse = [];
+    const used = new Set();
+    const categories = Object.keys(byCategory).sort(
+      (a, b) =>
+        new Date(byCategory[b][0]?.createdAt || 0) -
+        new Date(byCategory[a][0]?.createdAt || 0),
+    );
+
+    // First pass: one from each category
+    for (const cat of categories) {
+      const market = byCategory[cat][0];
+      if (market && !used.has(market._id)) {
+        diverse.push(market);
+        used.add(market._id);
+      }
+    }
+
+    // Second pass: fill remaining slots by creation date
+    const remaining = transformed
+      .filter((m) => !used.has(m._id))
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+    diverse.push(...remaining);
+
+    transformed = diverse;
+  } else if (category === "Breaking") {
+    // Breaking: Diverse markets with biggest price changes
+    // Ensure variety by picking top market from each category first
+    const byCategory = {};
+    transformed.forEach((m) => {
+      const cat = m.category || "Other";
+      if (!byCategory[cat]) byCategory[cat] = [];
+      byCategory[cat].push(m);
+    });
+
+    // Sort each category by price change
+    Object.values(byCategory).forEach((arr) => {
+      arr.sort(
+        (a, b) =>
+          Math.abs(b.priceChange24h || 0) - Math.abs(a.priceChange24h || 0),
+      );
+    });
+
+    // Pick top market from each category, then fill with remaining by price change
+    const diverse = [];
+    const used = new Set();
+    const categories = Object.keys(byCategory).sort(
+      (a, b) =>
+        Math.abs(byCategory[b][0]?.priceChange24h || 0) -
+        Math.abs(byCategory[a][0]?.priceChange24h || 0),
+    );
+
+    // First pass: one from each category
+    for (const cat of categories) {
+      const market = byCategory[cat][0];
+      if (market && !used.has(market._id)) {
+        diverse.push(market);
+        used.add(market._id);
+      }
+    }
+
+    // Second pass: fill remaining slots by price change
+    const remaining = transformed
+      .filter((m) => !used.has(m._id))
+      .sort(
+        (a, b) =>
+          Math.abs(b.priceChange24h || 0) - Math.abs(a.priceChange24h || 0),
+      );
+    diverse.push(...remaining);
+
+    transformed = diverse;
   } else {
     // Default: Sort by volume (Trending and All)
     transformed.sort((a, b) => (b.totalVolume || 0) - (a.totalVolume || 0));

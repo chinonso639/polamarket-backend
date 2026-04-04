@@ -729,12 +729,16 @@ const executeTrade = asyncHandler(async (req, res) => {
     invalidateMarket(localMarketId);
 
     // Emit Socket.io events (to both individual market room and all markets room)
-    emitPriceUpdate(localMarketId, {
-      yesPrice: tradeResult.pricesAfter.yesPrice,
-      noPrice: tradeResult.pricesAfter.noPrice,
-      outcomePrices: tradeResult.pricesAfter.outcomePrices,
-      volume: market.totalVolume + tradeAmount,
-    });
+    emitPriceUpdate(
+      localMarketId,
+      {
+        yesPrice: tradeResult.pricesAfter.yesPrice,
+        noPrice: tradeResult.pricesAfter.noPrice,
+        outcomePrices: tradeResult.pricesAfter.outcomePrices,
+        volume: market.totalVolume + tradeAmount,
+      },
+      market.category,
+    );
 
     emitTrade(localMarketId, {
       outcome: normalizedOutcome,
