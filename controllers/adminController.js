@@ -16,27 +16,132 @@ const { asyncHandler } = require("../middleware/errorHandler");
  * Get admin dashboard
  */
 const getDashboard = asyncHandler(async (req, res) => {
-  const [totalUsers, totalMarkets, totalBets, recentUsers, recentMarkets] =
-    await Promise.all([
-      User.countDocuments(),
-      Market.countDocuments(),
-      Bet.countDocuments(),
-      User.find()
-        .sort({ createdAt: -1 })
-        .limit(5)
-        .select("username email createdAt")
-        .lean(),
-      Market.find()
-        .sort({ createdAt: -1 })
-        .limit(5)
-        .select("question status createdAt")
-        .lean(),
-    ]);
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  const [
+    totalUsers,
+    activeUsers,
+    totalMarkets,
+    activeMarkets,
+    totalBets,
+    pendingWithdrawals,
+    totalVolumeAgg,
+    revenueByType,
+    todayRevenue,
+    topMarkets,
+    recentTransactions,
+  ] = await Promise.all([
+    User.countDocuments(),
+    User.countDocuments({
+      lastLogin: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+    }),
+    Market.countDocuments(),
+    Market.countDocuments({ resolved: false, paused: false }),
+    Bet.countDocuments(),
+    Transaction.countDocuments({ type: "withdrawal", status: "pending" }),
+    Transaction.aggregate([
+      {
+        $match: {
+          status: "completed",
+          type: { $in: ["trade_buy", "trade_sell"] },
+        },
+      },
+      { $group: { _id: null, total: { $sum: { $ifNull: ["$amount", 0] } } } },
+    ]),
+    Transaction.aggregate([
+      {
+        $match: {
+          status: "completed",
+          feeType: { $in: ["trading_fee", "withdrawal_fee", "deposit_fee"] },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          tradingFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "trading_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+          spreadFees: { $sum: { $ifNull: ["$spreadFee", 0] } },
+          withdrawalFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "withdrawal_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]),
+    Transaction.aggregate([
+      { $match: { status: "completed", createdAt: { $gte: todayStart } } },
+      {
+        $group: {
+          _id: null,
+          revenue: {
+            $sum: {
+              $add: [{ $ifNull: ["$fee", 0] }, { $ifNull: ["$spreadFee", 0] }],
+            },
+          },
+          volume: { $sum: { $ifNull: ["$amount", 0] } },
+        },
+      },
+    ]),
+    Market.find()
+      .sort({ totalFeesCollected: -1 })
+      .limit(10)
+      .select(
+        "question totalFeesCollected totalSpreadCollected liquidity resolved",
+      )
+      .lean(),
+    Transaction.find({ status: "completed" })
+      .sort({ createdAt: -1 })
+      .limit(15)
+      .populate("userId", "username email")
+      .select("type amount fee spreadFee netAmount feeType createdAt")
+      .lean(),
+  ]);
+
+  const revenueAgg = revenueByType[0] || {
+    tradingFees: 0,
+    spreadFees: 0,
+    withdrawalFees: 0,
+  };
+  const tradingFees = revenueAgg.tradingFees;
+  const spreadFees = revenueAgg.spreadFees;
+  const withdrawalFees = revenueAgg.withdrawalFees;
+  const totalRevenue = tradingFees + spreadFees + withdrawalFees;
+  const totalVolume = totalVolumeAgg[0]?.total || 0;
+
+  const todayData = todayRevenue[0] || { revenue: 0, volume: 0 };
 
   return response.success(res, {
-    stats: { totalUsers, totalMarkets, totalBets },
-    recentUsers,
-    recentMarkets,
+    stats: {
+      users: { total: totalUsers, active: activeUsers },
+      markets: { total: totalMarkets, active: activeMarkets },
+      trading: { totalBets, totalVolume },
+      pendingWithdrawals,
+      totalRevenue,
+      todayVolume: todayData.volume,
+    },
+    revenue: {
+      total: totalRevenue,
+      tradingFees,
+      spreadFees,
+      withdrawalFees,
+      today: todayData.revenue,
+      todayVolume: todayData.volume,
+    },
+    topMarkets,
+    recentTransactions,
   });
 });
 
@@ -45,14 +150,66 @@ const getDashboard = asyncHandler(async (req, res) => {
  * Get platform analytics
  */
 const getAnalytics = asyncHandler(async (req, res) => {
-  const { period = "7d" } = req.query;
+  const { period = "30d" } = req.query;
+  const days = period === "7d" ? 7 : period === "14d" ? 14 : 30;
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-  // Placeholder analytics
+  const [dailyRevenue, dailyUsers, dailyVolume, newMarkets, resolvedMarkets] =
+    await Promise.all([
+      Transaction.aggregate([
+        { $match: { status: "completed", createdAt: { $gte: since } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+            revenue: {
+              $sum: {
+                $add: [
+                  { $ifNull: ["$fee", 0] },
+                  { $ifNull: ["$spreadFee", 0] },
+                ],
+              },
+            },
+            volume: { $sum: { $ifNull: ["$amount", 0] } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      User.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      Bet.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+            volume: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      Market.countDocuments({ createdAt: { $gte: since } }),
+      Market.countDocuments({ resolved: true, updatedAt: { $gte: since } }),
+    ]);
+
+  const totalRevenue = dailyRevenue.reduce((s, d) => s + d.revenue, 0);
+  const totalVolume = dailyVolume.reduce((s, d) => s + d.volume, 0);
+  const totalNewUsers = dailyUsers.reduce((s, d) => s + d.count, 0);
+
   return response.success(res, {
     period,
-    users: { new: 0, active: 0 },
-    volume: { total: 0, daily: [] },
-    markets: { created: 0, resolved: 0 },
+    revenue: { total: totalRevenue, daily: dailyRevenue },
+    users: { new: totalNewUsers, daily: dailyUsers },
+    volume: { total: totalVolume, daily: dailyVolume },
+    markets: { created: newMarkets, resolved: resolvedMarkets },
   });
 });
 
@@ -61,16 +218,179 @@ const getAnalytics = asyncHandler(async (req, res) => {
  * Get revenue breakdown
  */
 const getRevenue = asyncHandler(async (req, res) => {
-  const totalFees = await Market.aggregate([
-    { $group: { _id: null, total: { $sum: "$totalFeesCollected" } } },
+  const { period = "30d" } = req.query;
+  const days =
+    period === "7d" ? 7 : period === "14d" ? 14 : period === "90d" ? 90 : 30;
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+
+  const [periodAgg, dailySeries, todayData, allTimeAgg] = await Promise.all([
+    Transaction.aggregate([
+      {
+        $match: {
+          status: "completed",
+          createdAt: { $gte: since },
+          feeType: { $ne: "none" },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          tradingFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "trading_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+          spreadFees: { $sum: { $ifNull: ["$spreadFee", 0] } },
+          withdrawalFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "withdrawal_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]),
+    Transaction.aggregate([
+      { $match: { status: "completed", createdAt: { $gte: since } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+          revenue: {
+            $sum: {
+              $add: [{ $ifNull: ["$fee", 0] }, { $ifNull: ["$spreadFee", 0] }],
+            },
+          },
+          tradingFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "trading_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+          spreadFees: { $sum: { $ifNull: ["$spreadFee", 0] } },
+          withdrawalFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "withdrawal_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+          volume: { $sum: { $ifNull: ["$amount", 0] } },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+    Transaction.aggregate([
+      { $match: { status: "completed", createdAt: { $gte: todayStart } } },
+      {
+        $group: {
+          _id: null,
+          tradingFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "trading_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+          spreadFees: { $sum: { $ifNull: ["$spreadFee", 0] } },
+          withdrawalFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "withdrawal_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+          volume: { $sum: { $ifNull: ["$amount", 0] } },
+        },
+      },
+    ]),
+    Transaction.aggregate([
+      { $match: { status: "completed", feeType: { $ne: "none" } } },
+      {
+        $group: {
+          _id: null,
+          tradingFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "trading_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+          spreadFees: { $sum: { $ifNull: ["$spreadFee", 0] } },
+          withdrawalFees: {
+            $sum: {
+              $cond: [
+                { $eq: ["$feeType", "withdrawal_fee"] },
+                { $ifNull: ["$fee", 0] },
+                0,
+              ],
+            },
+          },
+        },
+      },
+    ]),
   ]);
 
+  const p = periodAgg[0] || {
+    tradingFees: 0,
+    spreadFees: 0,
+    withdrawalFees: 0,
+  };
+  const a = allTimeAgg[0] || {
+    tradingFees: 0,
+    spreadFees: 0,
+    withdrawalFees: 0,
+  };
+
+  const periodTotal = p.tradingFees + p.spreadFees + p.withdrawalFees;
+  const allTimeTotal = a.tradingFees + a.spreadFees + a.withdrawalFees;
+
+  const t = todayData[0] || {
+    tradingFees: 0,
+    spreadFees: 0,
+    withdrawalFees: 0,
+    volume: 0,
+  };
+
   return response.success(res, {
-    totalFees: totalFees[0]?.total || 0,
-    breakdown: {
-      tradingFees: 0,
-      withdrawalFees: 0,
+    period,
+    total: periodTotal,
+    tradingFees: p.tradingFees,
+    spreadFees: p.spreadFees,
+    withdrawalFees: p.withdrawalFees,
+    today: {
+      total: t.tradingFees + t.spreadFees + t.withdrawalFees,
+      tradingFees: t.tradingFees,
+      spreadFees: t.spreadFees,
+      withdrawalFees: t.withdrawalFees,
     },
+    todayVolume: t.volume,
+    allTime: {
+      total: allTimeTotal,
+      tradingFees: a.tradingFees,
+      spreadFees: a.spreadFees,
+      withdrawalFees: a.withdrawalFees,
+    },
+    daily: dailySeries,
   });
 });
 
@@ -176,14 +496,24 @@ const updateMarket = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/admin/markets/:id/resolve
- * Resolve market
+ * Resolve market and settle all open bets
  */
 const resolveMarket = asyncHandler(async (req, res) => {
   const { outcome } = req.body;
+  if (!outcome || !["YES", "NO"].includes(outcome.toUpperCase())) {
+    return response.error(res, "outcome must be YES or NO", 400);
+  }
+  const upperOutcome = outcome.toUpperCase();
 
   const market = await Market.findByIdAndUpdate(
     req.params.id,
-    { resolved: true, resolvedOutcome: outcome, resolvedAt: new Date() },
+    {
+      resolved: true,
+      outcome: upperOutcome,
+      resolvedAt: new Date(),
+      isTradingActive: false,
+      resolutionSource: "admin",
+    },
     { new: true },
   );
 
@@ -191,8 +521,12 @@ const resolveMarket = asyncHandler(async (req, res) => {
     return response.notFound(res, "Market");
   }
 
-  logger.info(`Admin resolved market: ${market.question} -> ${outcome}`);
-  return response.success(res, { market }, "Market resolved");
+  // Settle all open bets and credit users
+  const { settleResolvedMarketBets } = require("../oracles/subgraphOracle");
+  await settleResolvedMarketBets(market._id, upperOutcome, market.question);
+
+  logger.info(`Admin resolved market: ${market.question} -> ${upperOutcome}`);
+  return response.success(res, { market }, "Market resolved and bets settled");
 });
 
 /**

@@ -256,16 +256,21 @@ function buyShares(market, outcome, amount, options = {}) {
   validateTradeRequest(market, amount);
 
   const feeRate = market.feeRate || 0.02;
+  const spreadRate = market.spreadRate || 0.005;
   const fee = amount * feeRate;
   const amountAfterFee = amount - fee;
+  // Spread is taken from amountAfterFee (additional revenue slice)
+  const spreadFee = amountAfterFee * spreadRate;
+  const amountForShares = amountAfterFee - spreadFee;
+
   const pricesBefore = getPrices(market);
   const entryPrice = pricesBefore.outcomePrices[normalizedOutcome];
   const result = calculateSharesForCost(
     market,
     normalizedOutcome,
-    amountAfterFee,
+    amountForShares,
   );
-  const avgPrice = amountAfterFee / result.shares;
+  const avgPrice = amountForShares / result.shares;
   const slippage = Math.abs(avgPrice - entryPrice) / entryPrice;
 
   if (slippage > maxSlippage) {
@@ -277,7 +282,7 @@ function buyShares(market, outcome, amount, options = {}) {
   const updatedStates = applyPoolDelta(
     result.updatedStates,
     normalizedOutcome,
-    amountAfterFee,
+    amountForShares,
   );
 
   return {
@@ -285,9 +290,12 @@ function buyShares(market, outcome, amount, options = {}) {
     outcome: normalizedOutcome,
     shares: result.shares,
     amountSpent: amount,
-    amountAfterFee,
+    amountAfterFee: amountForShares,
     fee,
+    spreadFee,
+    totalFeesPaid: fee + spreadFee,
     feeRate,
+    spreadRate,
     avgPrice,
     entryPrice,
     slippage,
@@ -332,8 +340,10 @@ function sellShares(market, outcome, shares) {
   const newCost = calculateCost(statesAfterSale, b);
   const grossProceeds = currentCost - newCost;
   const feeRate = market.feeRate || 0.02;
+  const spreadRate = market.spreadRate || 0.005;
   const fee = grossProceeds * feeRate;
-  const netProceeds = grossProceeds - fee;
+  const spreadFee = grossProceeds * spreadRate;
+  const netProceeds = grossProceeds - fee - spreadFee;
   const updatedStates = applyPoolDelta(
     statesAfterSale,
     normalizedOutcome,
@@ -346,6 +356,8 @@ function sellShares(market, outcome, shares) {
     shares: sellAmount,
     grossProceeds,
     fee,
+    spreadFee,
+    totalFeesPaid: fee + spreadFee,
     netProceeds,
     pricesAfter: getPrices({ ...market, outcomeStates: updatedStates }),
     marketUpdate: buildMarketUpdate(market, updatedStates),

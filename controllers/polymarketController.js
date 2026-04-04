@@ -336,80 +336,80 @@ const fetchLiveScore = async (slugPrefix, teamA, teamB, gameStartTimestamp) => {
  * Known primary category tags from Gamma (case-insensitive matching)
  */
 const CATEGORY_TAG_MAP = {
-  nba: "Sports",
-  nfl: "Sports",
-  mlb: "Sports",
-  nhl: "Sports",
-  soccer: "Sports",
-  football: "Sports",
-  basketball: "Sports",
-  baseball: "Sports",
-  tennis: "Sports",
-  golf: "Sports",
-  "champions league": "Sports",
-  "premier league": "Sports",
-  "world cup": "Sports",
-  epl: "Sports",
-  superbowl: "Sports",
-  "super bowl": "Sports",
-  ufc: "Sports",
-  boxing: "Sports",
-  f1: "Sports",
-  "formula 1": "Sports",
+  nba: "sports",
+  nfl: "sports",
+  mlb: "sports",
+  nhl: "sports",
+  soccer: "sports",
+  football: "sports",
+  basketball: "sports",
+  baseball: "sports",
+  tennis: "sports",
+  golf: "sports",
+  "champions league": "sports",
+  "premier league": "sports",
+  "world cup": "sports",
+  epl: "sports",
+  superbowl: "sports",
+  "super bowl": "sports",
+  ufc: "sports",
+  boxing: "sports",
+  f1: "sports",
+  "formula 1": "sports",
 
-  politics: "Politics",
-  trump: "Politics",
-  biden: "Politics",
-  "trump presidency": "Politics",
-  congress: "Politics",
-  senate: "Politics",
+  politics: "politics",
+  trump: "politics",
+  biden: "politics",
+  "trump presidency": "politics",
+  congress: "politics",
+  senate: "politics",
 
-  elections: "Politics",
-  election: "Politics",
-  "us election": "Politics",
-  "world elections": "Politics",
-  "global elections": "Politics",
-  primary: "Politics",
-  nominee: "Politics",
+  elections: "politics",
+  election: "politics",
+  "us election": "politics",
+  "world elections": "politics",
+  "global elections": "politics",
+  primary: "politics",
+  nominee: "politics",
 
-  crypto: "Crypto",
-  bitcoin: "Crypto",
-  ethereum: "Crypto",
-  solana: "Crypto",
-  defi: "Crypto",
+  crypto: "crypto",
+  bitcoin: "crypto",
+  ethereum: "crypto",
+  solana: "crypto",
+  defi: "crypto",
 
-  economy: "Economy",
-  "fed rates": "Economy",
-  inflation: "Economy",
-  recession: "Economy",
-  gdp: "Economy",
-  tariff: "Economy",
+  economy: "other",
+  "fed rates": "other",
+  inflation: "other",
+  recession: "other",
+  gdp: "other",
+  tariff: "other",
 
-  finance: "Finance",
-  stocks: "Finance",
-  "stock market": "Finance",
+  finance: "business",
+  stocks: "business",
+  "stock market": "business",
 
-  tech: "Tech",
-  ai: "Tech",
-  "artificial intelligence": "Tech",
+  tech: "science",
+  ai: "science",
+  "artificial intelligence": "science",
 
-  iran: "Iran",
+  iran: "world",
 
-  geopolitics: "Geopolitics",
-  war: "Geopolitics",
-  military: "Geopolitics",
-  nato: "Geopolitics",
+  geopolitics: "world",
+  war: "world",
+  military: "world",
+  nato: "world",
 
-  esports: "Esports",
-  gaming: "Esports",
+  esports: "entertainment",
+  gaming: "entertainment",
 
-  weather: "Weather",
-  climate: "Weather",
+  weather: "science",
+  climate: "science",
 
-  culture: "Culture",
-  entertainment: "Culture",
-  movies: "Culture",
-  music: "Culture",
+  culture: "entertainment",
+  entertainment: "entertainment",
+  movies: "entertainment",
+  music: "entertainment",
 };
 
 /**
@@ -448,7 +448,7 @@ const mapCategory = (tags = [], question = "") => {
     }
   }
 
-  return "World";
+  return "world";
 };
 
 const normalizeOutcomeKey = (value = "") =>
@@ -1640,7 +1640,7 @@ const getMarketById = asyncHandler(async (req, res) => {
         _id: id,
         question: localMarket.question || "Market",
         description: "",
-        category: "World",
+        category: "world",
         endDate: localMarket.endDate,
         yesPrice: 0.5,
         noPrice: 0.5,
@@ -2156,11 +2156,174 @@ const getPriceHistory = asyncHandler(async (req, res) => {
   }
 });
 
+/**
+ * POST /api/polymarket/sports/explain
+ * Ask Kimi K2.5 to explain a sports betting contract in context.
+ * Streams the response as SSE.
+ */
+const explainContract = asyncHandler(async (req, res) => {
+  const {
+    marketType,
+    question,
+    teamA,
+    teamB,
+    contractLabel,
+    price,
+    league,
+    history = [],
+    _onboarding = false,
+  } = req.body;
+
+  if (!question && !contractLabel) {
+    return response.error(res, "question or contractLabel is required", 400);
+  }
+
+  const MOONSHOT_API_KEY = process.env.MOONSHOT_API_KEY;
+  if (!MOONSHOT_API_KEY || MOONSHOT_API_KEY === "your-moonshot-api-key-here") {
+    return response.error(res, "Kimi AI not configured", 503);
+  }
+
+  let messages;
+
+  if (_onboarding) {
+    // Onboarding mode: question IS the full prompt, no sports context needed
+    const onboardingSystem = `You are a friendly, enthusiastic guide for Polygrid, a prediction market platform. 
+Explain clearly in plain English. Use simple language. Format with short paragraphs separated by blank lines. 
+No markdown headers — just clean readable text. Keep the full response under 250 words.`;
+    messages =
+      history.length > 0
+        ? [
+            { role: "system", content: onboardingSystem },
+            ...history.map((m) => ({ role: m.role, content: m.content })),
+          ]
+        : [
+            { role: "system", content: onboardingSystem },
+            { role: "user", content: question },
+          ];
+  } else {
+    // Sports contract explanation mode
+    const systemPrompt = `You are a friendly sports betting guide for Polygrid, a prediction market platform.
+Your job is to explain betting contracts to newcomers in plain English — short, clear, and conversational.
+Always start with a one-line "plain English" summary, then give a brief breakdown.
+Use the match context (teams, league, market type) to make the explanation specific, not generic.
+Do NOT use jargon without explaining it. Keep answers under 120 words.`;
+
+    const TYPE_DESCRIPTIONS = {
+      moneyline:
+        "A moneyline bet is simply: who wins this match? (or will there be a draw?)",
+      spreads:
+        "A spread bet adds a handicap (e.g. -1.5 goals) to level the playing field between teams.",
+      totals:
+        "A totals bet (Over/Under) asks: will the total goals scored be above or below a number?",
+      both_teams_to_score:
+        "Both Teams to Score (BTTS): will both teams score at least one goal?",
+      soccer_exact_score:
+        "An exact score bet: you're predicting the precise final scoreline.",
+      soccer_halftime_result:
+        "A halftime result bet: what will the score/situation be at half-time?",
+      soccer_anytime_goalscorer:
+        "An anytime goalscorer bet: will this player score at any point in the match?",
+      corners:
+        "A corners bet: predicting the total number of corner kicks in the match.",
+    };
+
+    const matchContext = [
+      teamA && teamB ? `Match: ${teamA} vs ${teamB}` : null,
+      league ? `League: ${league}` : null,
+      marketType
+        ? `Market type: ${marketType} — ${TYPE_DESCRIPTIONS[marketType] || marketType}`
+        : null,
+      question ? `Contract question: "${question}"` : null,
+      contractLabel ? `Contract being traded: "${contractLabel}"` : null,
+      price != null
+        ? `Current price: ${Math.round(price * 100)}¢ (${Math.round(price * 100)}% probability)`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const userMessage = `Please explain this contract to me:\n\n${matchContext}`;
+
+    messages =
+      history.length > 0
+        ? [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userMessage },
+            { role: "assistant", content: "[context received]" },
+            ...history.map((m) => ({ role: m.role, content: m.content })),
+          ]
+        : [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userMessage },
+          ];
+  }
+
+  // Stream SSE to client
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  try {
+    const kimiResponse = await fetch(
+      "https://api.moonshot.ai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${MOONSHOT_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "moonshot-v1-8k",
+          messages,
+          stream: true,
+          max_tokens: _onboarding ? 400 : 200,
+        }),
+      },
+    );
+
+    if (!kimiResponse.ok) {
+      const err = await kimiResponse.text();
+      res.write(
+        `data: ${JSON.stringify({ error: "Kimi API error: " + err })}\n\n`,
+      );
+      res.end();
+      return;
+    }
+
+    const reader = kimiResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep incomplete line in buffer
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === "data: [DONE]") continue;
+        if (trimmed.startsWith("data: ")) {
+          res.write(trimmed + "\n\n");
+        }
+      }
+    }
+
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (err) {
+    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+    res.end();
+  }
+});
+
 module.exports = {
   getMarkets,
   getTrendingMarkets,
   getLiveSportsMatches,
   getSportsMatch,
+  explainContract,
   getMarketById,
   searchMarkets,
   getCategories,

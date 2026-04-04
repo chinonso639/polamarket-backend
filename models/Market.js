@@ -117,11 +117,22 @@ const marketSchema = new mongoose.Schema(
     // Fee configuration
     feeRate: {
       type: Number,
-      default: 0.02, // 2% fee
+      default: 0.02, // 2% base trading fee
       min: [0, "Fee rate cannot be negative"],
       max: [0.1, "Fee rate cannot exceed 10%"],
     },
     totalFeesCollected: {
+      type: Number,
+      default: 0,
+    },
+    // Spread fee — charged on top of trading fee (0.5% each side)
+    spreadRate: {
+      type: Number,
+      default: 0.005,
+      min: [0, "Spread rate cannot be negative"],
+      max: [0.05, "Spread rate cannot exceed 5%"],
+    },
+    totalSpreadCollected: {
       type: Number,
       default: 0,
     },
@@ -215,6 +226,7 @@ const marketSchema = new mongoose.Schema(
 
     // External market reference (Polymarket/Gamma)
     externalId: String,
+    slug: String,
     conditionId: String,
     externalSource: {
       type: String,

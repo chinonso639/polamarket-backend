@@ -447,9 +447,18 @@ const ensureMarket = async (marketId, requestedOutcome = null) => {
     // Not a valid ObjectId — continue to external lookups
   }
 
-  // 2. Already imported from Gamma?
-  const existing = await Market.findOne({ externalId: marketId });
-  if (existing) return syncExternalOutcomeStates(existing, requestedOutcome);
+  // 2. Already imported from Gamma? Also match by slug (sports markets use slug as marketId)
+  const existing = await Market.findOne({
+    $or: [{ externalId: marketId }, { slug: marketId }],
+  });
+  if (existing) {
+    // Back-fill slug if missing
+    if (!existing.slug && marketId) {
+      existing.slug = marketId;
+      await existing.save();
+    }
+    return syncExternalOutcomeStates(existing, requestedOutcome);
+  }
 
   // 3. Fetch from Gamma and auto-create
   const { data: raw } = await axios.get(
@@ -481,10 +490,35 @@ const ensureMarket = async (marketId, requestedOutcome = null) => {
     .map((t) => (typeof t === "string" ? t : t.label || t.name || ""))
     .filter(Boolean);
 
+  // Detect sports category from slug pattern (e.g. "bun-fre-bay-2026-04-04-ml")
+  // marketId is the route param — for sports markets this IS the slug
+  const slugStr = String(gm.slug || gm.market_slug || marketId || "");
+  const isSportsSlug = /^[a-z]{2,}-.*-20\d{2}-\d{2}-\d{2}/.test(slugStr);
+  const detectedCategory = isSportsSlug
+    ? "sports"
+    : tagList.some((t) =>
+          [
+            "soccer",
+            "football",
+            "basketball",
+            "nba",
+            "nfl",
+            "mlb",
+            "nhl",
+            "tennis",
+            "golf",
+            "ufc",
+            "boxing",
+            "f1",
+          ].includes(t.toLowerCase()),
+        )
+      ? "sports"
+      : "other";
+
   const newMarket = await Market.create({
     question: gm.question || gm.title || "Market",
     description: gm.description || "",
-    category: "other",
+    category: detectedCategory,
     endDate,
     outcomeStates,
     qYes: compatibilityFields.qYes,
@@ -495,6 +529,7 @@ const ensureMarket = async (marketId, requestedOutcome = null) => {
     virtualLiquidityBuffer: b * 10,
     totalVolume: extVol,
     externalId: gm.id || gm.condition_id || marketId,
+    slug: slugStr || undefined,
     conditionId: gm.conditionId || gm.condition_id || "",
     externalSource: "gamma",
     imageUrl: gm.image || gm.icon || null,
@@ -509,7 +544,7 @@ const ensureMarket = async (marketId, requestedOutcome = null) => {
 
 const executeTrade = asyncHandler(async (req, res) => {
   const { id: marketId } = req.params;
-  const { outcome, amount, maxSlippage = 0.1 } = req.body;
+  const { outcome, amount, maxSlippage = 0.1, marketSlug } = req.body;
   const userId = req.userId;
   const normalizedOutcome = normalizeOutcomeKey(outcome);
   const tradeAmount = parseFloat(amount);
@@ -526,6 +561,21 @@ const executeTrade = asyncHandler(async (req, res) => {
 
   // Use the actual MongoDB _id for all subsequent operations
   const localMarketId = market._id;
+
+  // If a marketSlug was sent from the frontend (sports markets send the URL slugPrefix),
+  // back-fill slug and fix category on the market document
+  if (
+    marketSlug &&
+    (!market.slug || market.slug === String(market.externalId))
+  ) {
+    const updates = { slug: marketSlug };
+    if (market.category !== "sports") {
+      updates.category = "sports";
+    }
+    await Market.findByIdAndUpdate(localMarketId, { $set: updates });
+    market.slug = marketSlug;
+    market.category = "sports";
+  }
 
   // Check if market allows trading
   const canTrade = market.canTrade();
@@ -602,6 +652,7 @@ const executeTrade = asyncHandler(async (req, res) => {
         },
         $inc: {
           totalFeesCollected: tradeResult.fee,
+          totalSpreadCollected: tradeResult.spreadFee || 0,
           totalVolume: amount,
           totalTrades: 1,
           settlementPool: tradeResult.amountAfterFee,
@@ -616,6 +667,7 @@ const executeTrade = asyncHandler(async (req, res) => {
       {
         $inc: {
           balance: -tradeAmount,
+          withdrawable: -tradeAmount,
           totalWagered: tradeAmount,
         },
         $set: { lastTradeAt: new Date() },
@@ -659,6 +711,8 @@ const executeTrade = asyncHandler(async (req, res) => {
       type: "trade_buy",
       amount: tradeAmount,
       fee: tradeResult.fee,
+      spreadFee: tradeResult.spreadFee || 0,
+      feeType: "trading_fee",
       netAmount: tradeResult.amountAfterFee,
       status: "completed",
       marketId: localMarketId,
@@ -1193,6 +1247,8 @@ const sellShares = asyncHandler(async (req, res) => {
   market.yesPool = sellResult.marketUpdate.yesPool;
   market.noPool = sellResult.marketUpdate.noPool;
   market.totalFeesCollected = (market.totalFeesCollected || 0) + fee;
+  market.totalSpreadCollected =
+    (market.totalSpreadCollected || 0) + (sellResult.spreadFee || 0);
   market.totalTrades = (market.totalTrades || 0) + 1;
   market.settlementPool = Math.max(
     0,
@@ -1215,15 +1271,41 @@ const sellShares = asyncHandler(async (req, res) => {
     realizedPnL += closedProceeds - closedCostBasis;
 
     if (closeShares >= bet.shares) {
-      await Bet.findByIdAndDelete(bet._id);
+      // Atomic delete: only succeeds if shares haven't changed since we read them
+      const deleted = await Bet.findOneAndDelete({
+        _id: bet._id,
+        shares: bet.shares,
+      });
+      if (!deleted) {
+        // Concurrent request already modified this bet — abort to avoid double-spend
+        return response.error(
+          res,
+          "Concurrent sell detected. Please try again.",
+          409,
+        );
+      }
     } else {
       const nextShares = bet.shares - closeShares;
       const nextAmountSpent = Math.max(0, bet.amountSpent - closedCostBasis);
-      bet.shares = nextShares;
-      bet.amountSpent = nextAmountSpent;
-      bet.avgPrice =
-        nextShares > 0 ? nextAmountSpent / nextShares : bet.avgPrice;
-      await bet.save();
+      // Atomic update: only succeeds if shares match what we read
+      const updated = await Bet.findOneAndUpdate(
+        { _id: bet._id, shares: bet.shares },
+        {
+          $set: {
+            shares: nextShares,
+            amountSpent: nextAmountSpent,
+            avgPrice:
+              nextShares > 0 ? nextAmountSpent / nextShares : bet.avgPrice,
+          },
+        },
+      );
+      if (!updated) {
+        return response.error(
+          res,
+          "Concurrent sell detected. Please try again.",
+          409,
+        );
+      }
     }
 
     remainingToClose -= closeShares;
@@ -1250,6 +1332,8 @@ const sellShares = asyncHandler(async (req, res) => {
     type: "trade_sell",
     amount: sellResult.grossProceeds,
     fee,
+    spreadFee: sellResult.spreadFee || 0,
+    feeType: "trading_fee",
     netAmount: netProceeds,
     marketId: id,
     balanceBefore: user?.balance || 0,

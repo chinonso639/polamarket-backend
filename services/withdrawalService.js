@@ -204,8 +204,8 @@ async function requestWithdrawal({
     throw new Error("Insufficient withdrawable balance");
   }
 
-  // Calculate fee (1% network fee)
-  const fee = amount * 0.01;
+  // Calculate fee (1.5% platform withdrawal fee)
+  const fee = amount * 0.015;
   const netAmount = amount - fee;
 
   // Create transaction
@@ -214,6 +214,7 @@ async function requestWithdrawal({
     type: "withdrawal",
     amount,
     fee,
+    feeType: "withdrawal_fee",
     netAmount,
     currency: token,
     status: "pending",

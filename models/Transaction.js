@@ -109,6 +109,17 @@ const transactionSchema = new mongoose.Schema(
       confirmations: Number,
     },
 
+    // Fee breakdown
+    spreadFee: {
+      type: Number,
+      default: 0,
+    },
+    feeType: {
+      type: String,
+      enum: ["trading_fee", "spread_fee", "withdrawal_fee", "deposit_fee", "none"],
+      default: "none",
+    },
+
     // Trade specific fields
     tradeDetails: {
       outcome: {

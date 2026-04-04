@@ -98,7 +98,7 @@ const getPositions = asyncHandler(async (req, res) => {
   const positions = await Bet.find(query)
     .populate(
       "marketId",
-      "question category outcome resolved qYes qNo b endDate outcomeStates",
+      "question category outcome resolved qYes qNo b endDate outcomeStates slug externalId",
     )
     .sort({ createdAt: -1 })
     .lean();

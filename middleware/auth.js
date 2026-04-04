@@ -97,7 +97,11 @@ const requireAdmin = async (req, res, next) => {
   }
 
   // Check if user has admin role (you might want to add a role field to User model)
-  if (req.user.email !== process.env.ADMIN_EMAIL && !req.user.isAdmin) {
+  if (
+    req.user.email !== process.env.ADMIN_EMAIL &&
+    req.user.role !== "admin" &&
+    !req.user.isAdmin
+  ) {
     return response.forbidden(res, "Admin access required");
   }
 

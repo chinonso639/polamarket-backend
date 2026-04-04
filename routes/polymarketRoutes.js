@@ -28,6 +28,7 @@ router.get("/trending", polymarketController.getTrendingMarkets);
  */
 router.get("/sports/live", polymarketController.getLiveSportsMatches);
 router.get("/sports/match", polymarketController.getSportsMatch);
+router.post("/sports/explain", polymarketController.explainContract);
 
 /**
  * @route   GET /api/polymarket/search

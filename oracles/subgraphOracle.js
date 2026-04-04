@@ -558,6 +558,7 @@ module.exports = {
   getBatchResolutions,
   checkFallbackOracle,
   pollResolutions,
+  settleResolvedMarketBets,
   flagForDispute,
   getRecentResolutions,
   startPolling,
