@@ -829,12 +829,20 @@ const extractTagText = (tags = []) =>
 
 // Gamma slug prefix → soccer league name
 const SOCCER_SLUG_PREFIX_MAP = {
+  // English
+  epl: "Premier League",
+  eng: "Premier League",
+  prem: "Premier League",
+  enpl: "Premier League",
   bun: "Bundesliga",
   bl2: "2. Bundesliga",
   bl3: "3. Liga",
   sea: "Serie A",
   itsb: "Serie B",
   lal: "La Liga",
+  esp: "La Liga",
+  laliga: "La Liga",
+  lag: "La Liga",
   es2: "La Liga 2",
   elc: "Championship",
   efa: "Championship",
@@ -928,6 +936,15 @@ const NON_SOCCER_SLUG_PREFIXES = new Set([
   "crint",
   "cricp",
   "cri",
+  "cricipl",
+  "criind",
+  "criaus",
+  "crieng",
+  "crisa",
+  "crisl",
+  "criban",
+  "criwin",
+  "criafg",
   "ipl", // cricket
   "mlb",
   "kbo",
@@ -1022,6 +1039,12 @@ const detectSportsLeague = (market = {}) => {
     return "UCL";
   }
   if (t.includes("nba")) return "NBA";
+  // Known non-soccer slug prefixes: return null so parseMatchFromMarket can filter them out
+  if (NON_SOCCER_SLUG_PREFIXES.has(slugPrefix)) return null;
+
+  // Known soccer slug prefixes
+  if (SOCCER_SLUG_PREFIX_MAP[slugPrefix]) return "Soccer";
+
   if (t.includes("ncaa") || t.includes("ncaab")) return "NCAAB";
   if (t.includes("nhl")) return "NHL";
   if (t.includes("ufc") || t.includes("mma")) return "UFC";
@@ -1039,12 +1062,6 @@ const detectSportsLeague = (market = {}) => {
   if (t.includes("tennis") || t.includes("atp") || t.includes("wta")) {
     return "Tennis";
   }
-
-  // Known non-soccer slug prefixes: return null so parseMatchFromMarket can filter them out
-  if (NON_SOCCER_SLUG_PREFIXES.has(slugPrefix)) return null;
-
-  // Known soccer slug prefixes
-  if (SOCCER_SLUG_PREFIX_MAP[slugPrefix]) return "Soccer";
 
   // Soccer-heavy slugs often use 3-letter league + team codes (e.g. por-spo-cds)
   if (/^[a-z]{3,5}-[a-z0-9]{2,5}-[a-z0-9]{2,5}/.test(slug)) {
@@ -1182,13 +1199,25 @@ const parseMatchFromMarket = (market) => {
   // Skip markets resolving more than 7 days from now — too far to be "sports"
   if (hoursUntilEnd !== null && hoursUntilEnd > 168) return null;
 
+  // A closed/resolved market is always "ended" regardless of endDate window
+  const isClosed =
+    market.closed === true ||
+    market.resolved === true ||
+    market.active === false ||
+    market.accepting_orders === false;
+
   // isLive: market resolves within 12 hours — match is today or in progress
   const isLive =
-    hoursUntilEnd !== null && hoursUntilEnd >= -2 && hoursUntilEnd <= 12;
+    !isClosed &&
+    hoursUntilEnd !== null &&
+    hoursUntilEnd >= -2 &&
+    hoursUntilEnd <= 12;
 
   // matchStatus: finer label shown in the UI
   let matchStatus;
-  if (hoursUntilEnd === null) {
+  if (isClosed) {
+    matchStatus = "ended";
+  } else if (hoursUntilEnd === null) {
     matchStatus = "upcoming";
   } else if (hoursUntilEnd < -2) {
     matchStatus = "ended";
@@ -1231,10 +1260,8 @@ const parseMatchFromMarket = (market) => {
 const getLiveSportsMatches = asyncHandler(async (req, res) => {
   const limit = parseInt(req.query.limit) || 500;
   // page=1 → fast load (events only, 1 Gamma call)
-  // page=2 → full sweep (events + tagged + 8 broad pages)
+  // page=2 → full sweep (3 event pages + soccer tag + 8 broad market pages)
   const page = parseInt(req.query.page) || 1;
-
-  const leagueSlugs = Object.keys(SOCCER_SLUG_PREFIX_MAP);
 
   // Build request list based on page number
   const requests = [
@@ -1251,15 +1278,33 @@ const getLiveSportsMatches = asyncHandler(async (req, res) => {
   ];
 
   if (page >= 2) {
-    // Full sweep: tagged + 8 broad volume-ordered pages
+    // Full sweep: real soccer tag + 2 extra event pages + 8 broad market pages
     requests.push(
-      gammaApi.get("/markets", {
+      // Second events page (offset 500) — catches lower-volume Premier League / La Liga fixtures
+      gammaApi.get("/events", {
         params: {
           limit: 500,
-          tag_slug: leagueSlugs.slice(0, 30).join(","),
+          offset: 500,
           active: true,
           closed: false,
+          order: "volume",
+          ascending: false,
         },
+      }),
+      // Third events page
+      gammaApi.get("/events", {
+        params: {
+          limit: 500,
+          offset: 1000,
+          active: true,
+          closed: false,
+          order: "volume",
+          ascending: false,
+        },
+      }),
+      // tag_slug: "soccer" — real Gamma tag that covers all soccer markets
+      gammaApi.get("/markets", {
+        params: { limit: 500, tag_slug: "soccer", active: true, closed: false },
       }),
       ...Array.from({ length: 8 }, (_, i) =>
         gammaApi.get("/markets", {
@@ -1704,11 +1749,15 @@ const getMarketById = asyncHandler(async (req, res) => {
 
     let localMarket = null;
     try {
-      localMarket = await Market.findById(id)
-        .select(
-          "externalId conditionId outcomeStates question totalVolume endDate imageUrl tags",
-        )
-        .lean();
+      // Only attempt a MongoDB _id lookup if the id looks like a valid ObjectId
+      const isObjectId = /^[a-f\d]{24}$/i.test(id);
+      if (isObjectId) {
+        localMarket = await Market.findById(id)
+          .select(
+            "externalId conditionId outcomeStates question totalVolume endDate imageUrl tags",
+          )
+          .lean();
+      }
     } catch (_error) {
       localMarket = await Market.findOne({
         $or: [{ externalId: id }, { conditionId: id }],
@@ -1888,6 +1937,10 @@ const getSportsMatch = asyncHandler(async (req, res) => {
   // The /events endpoint is the most reliable source for low-volume leagues (K League etc.)
   // because it groups markets by event regardless of global volume rank.
   const allResults = await Promise.allSettled([
+    // Direct slug search — most reliable, always finds the exact match
+    gammaApi.get("/markets", {
+      params: { limit: 100, slug: slugPrefix },
+    }),
     // /events endpoint — active: catches upcoming/live matches in all leagues
     gammaApi.get("/events", {
       params: {
@@ -1898,7 +1951,18 @@ const getSportsMatch = asyncHandler(async (req, res) => {
         ascending: false,
       },
     }),
-    // /events endpoint — closed: catches recently finished matches
+    // /events offset 500 — Premier League / La Liga fixtures beyond top 500 by volume
+    gammaApi.get("/events", {
+      params: {
+        limit: 500,
+        offset: 500,
+        active: true,
+        closed: false,
+        order: "volume",
+        ascending: false,
+      },
+    }),
+    // /events closed — recently finished matches
     gammaApi.get("/events", {
       params: {
         limit: 500,
@@ -1907,6 +1971,10 @@ const getSportsMatch = asyncHandler(async (req, res) => {
         order: "volume",
         ascending: false,
       },
+    }),
+    // tag_slug: "soccer" — all soccer markets regardless of volume rank
+    gammaApi.get("/markets", {
+      params: { limit: 500, tag_slug: "soccer", active: true, closed: false },
     }),
     // Broad fallback — active markets by volume, 4 pages × 500
     ...Array.from({ length: 4 }, (_, i) =>
@@ -1937,53 +2005,123 @@ const getSportsMatch = asyncHandler(async (req, res) => {
   ]);
 
   let allMarkets = [];
+  let eventTeams = null; // teams array from the event object (has direct logo URLs)
+
+  // Expand an item that may be an event wrapper (has .markets[]) or a plain market
+  const expandItem = (item, extraTags = []) => {
+    if (Array.isArray(item.markets) && item.markets.length > 0) {
+      // It's an event object — pull teams for logos and expand nested markets
+      if (!eventTeams && Array.isArray(item.teams) && item.teams.length > 0) {
+        eventTeams = item.teams;
+      }
+      const evtTags = Array.isArray(item.tags) ? item.tags : [];
+      for (const m of item.markets) {
+        allMarkets.push({
+          ...m,
+          tags: [...evtTags, ...extraTags, ...(m.tags || [])],
+        });
+      }
+      return;
+    }
+    // Plain market object
+    allMarkets.push(
+      extraTags.length
+        ? { ...item, tags: [...extraTags, ...(item.tags || [])] }
+        : item,
+    );
+  };
+
   for (const result of allResults) {
     if (result.status !== "fulfilled") continue;
     const data = result.value.data;
-    // Events response: { events: [ { markets: [...], tags: [...] } ] }
+    // /events endpoint: { events: [ { markets: [...], tags: [...] } ] }
     const events = Array.isArray(data) ? null : data?.events || null;
     if (events) {
       for (const event of events) {
-        const eventMarkets = Array.isArray(event.markets) ? event.markets : [];
-        const eventTags = Array.isArray(event.tags) ? event.tags : [];
-        for (const m of eventMarkets) {
-          allMarkets.push({ ...m, tags: [...eventTags, ...(m.tags || [])] });
-        }
+        expandItem(event);
       }
     } else {
-      // Plain markets response
+      // Plain /markets response — each item may be a market OR an event wrapper
       const batch = Array.isArray(data)
         ? data
         : data?.markets || data?.data || [];
-      allMarkets = allMarkets.concat(batch);
+      for (const item of batch) {
+        expandItem(item);
+      }
     }
   }
 
-  // Filter to this match's slug prefix (deduplicate first)
-  const seenIds = new Set();
-  let matchMarkets = allMarkets.filter((m) => {
+  // Filter to this match's slug prefix — prefer the version with outcome data.
+  // The direct /markets?slug= call returns markets with no outcomes/prices.
+  // The /events endpoint returns the same markets WITH full outcome data.
+  // A naive Set-based dedup would keep the no-outcome version (it arrives first).
+  // Instead we use a Map and replace the stored version whenever a richer one arrives.
+  const hasOutcomeData = (m) =>
+    (m.outcomes != null && m.outcomes !== "[]" && m.outcomes !== "") ||
+    (m.outcomePrices != null &&
+      m.outcomePrices !== "[]" &&
+      m.outcomePrices !== "") ||
+    (Array.isArray(m.tokens) && m.tokens.length > 0);
+
+  const seenIds = new Map(); // id → market (best version seen so far)
+  const noIdMarkets = [];
+  for (const m of allMarkets) {
+    if (!m.slug || !m.slug.startsWith(slugPrefix)) continue;
     const id = m.id || m.condition_id || m.conditionId;
-    if (!id || seenIds.has(id)) return false;
-    seenIds.add(id);
-    return m.slug && m.slug.startsWith(slugPrefix);
-  });
+    if (!id) {
+      noIdMarkets.push(m);
+      continue;
+    }
+    const existing = seenIds.get(id);
+    if (!existing || (!hasOutcomeData(existing) && hasOutcomeData(m))) {
+      seenIds.set(id, m);
+    }
+  }
+  let matchMarkets = [...seenIds.values(), ...noIdMarkets];
 
   if (matchMarkets.length === 0) {
-    // Last-resort: try Gamma search endpoint by the slug prefix itself
+    // Last-resort strategy 1: fetch ALL events with no active/closed filter
+    // (catches matches that just transitioned between states)
     try {
-      const searchResult = await gammaApi.get("/markets", {
-        params: {
-          limit: 50,
-          // Some Gamma deployments support a 'slug_contains' or 'slug' search param
-          slug: slugPrefix,
-          active: true,
-          closed: false,
-        },
+      const allEventsResult = await gammaApi.get("/events", {
+        params: { limit: 500, order: "volume", ascending: false },
       });
-      const searchBatch = Array.isArray(searchResult.data)
-        ? searchResult.data
-        : searchResult.data?.markets || searchResult.data?.data || [];
-      const extra = searchBatch.filter(
+      const data = allEventsResult.data;
+      const events = Array.isArray(data) ? null : data?.events || null;
+      if (events) {
+        for (const event of events) {
+          const eventMarkets = Array.isArray(event.markets)
+            ? event.markets
+            : [];
+          const eventTags = Array.isArray(event.tags) ? event.tags : [];
+          for (const m of eventMarkets) {
+            if (m.slug && m.slug.startsWith(slugPrefix)) {
+              matchMarkets.push({
+                ...m,
+                tags: [...eventTags, ...(m.tags || [])],
+              });
+            }
+          }
+        }
+      }
+    } catch (_e) {
+      // ignore
+    }
+  }
+
+  if (matchMarkets.length === 0) {
+    // Last-resort strategy 2: search with the match-pair prefix (without date)
+    // e.g. "sea-pis-tor-2026-04-05" → try "sea-pis-tor-2026-04-05" then "sea-pis-tor"
+    const matchPairPrefix = slugPrefix.split("-").slice(0, 3).join("-"); // e.g. "sea-pis-tor"
+    try {
+      const pairResult = await gammaApi.get("/markets", {
+        params: { limit: 200, slug: matchPairPrefix },
+      });
+      const batch = Array.isArray(pairResult.data)
+        ? pairResult.data
+        : pairResult.data?.markets || pairResult.data?.data || [];
+      // Filter to only markets whose slug STARTS WITH the full date prefix
+      const extra = batch.filter(
         (m) => m.slug && m.slug.startsWith(slugPrefix),
       );
       if (extra.length > 0) {
@@ -1998,9 +2136,32 @@ const getSportsMatch = asyncHandler(async (req, res) => {
     return response.success(res, { slugPrefix, groups: [] });
   }
 
+  // Infer sportsMarketType from question text when Gamma hasn't set the field
+  const inferMarketType = (m) => {
+    if (m.sportsMarketType) return m.sportsMarketType;
+    const q = (m.question || "").toLowerCase();
+    if (
+      q.includes("o/u") ||
+      q.includes("total") ||
+      q.includes("over") ||
+      q.includes("under")
+    )
+      return "totals";
+    if (q.includes("spread") || /\s[+-]\d/.test(q)) return "spreads";
+    if (q.includes("both teams") && q.includes("score"))
+      return "both_teams_to_score";
+    if (q.includes("exact score") || /\d+-\d+/.test(q))
+      return "soccer_exact_score";
+    if (q.includes("half") || q.includes("ht")) return "soccer_halftime_result";
+    if (q.includes("goalscorer") || q.includes("anytime"))
+      return "soccer_anytime_goalscorer";
+    return "moneyline";
+  };
+
   // Extract team names and metadata from the moneyline market (most informative)
   const moneylineMarket =
     matchMarkets.find((m) => m.sportsMarketType === "moneyline") ||
+    matchMarkets.find((m) => inferMarketType(m) === "moneyline") ||
     matchMarkets[0];
 
   // Best team names: try to parse from "Team A vs Team B" in the question
@@ -2060,19 +2221,35 @@ const getSportsMatch = asyncHandler(async (req, res) => {
     }) || moneylineMarket;
 
   const parseOutcomePrices = (m) => {
+    // Already an array (e.g. from /events embed)
+    if (Array.isArray(m.outcomePrices)) return m.outcomePrices.map(Number);
     try {
-      return JSON.parse(m.outcomePrices || "[]").map(Number);
+      const parsed = JSON.parse(m.outcomePrices || "[]");
+      if (Array.isArray(parsed)) return parsed.map(Number);
     } catch {
-      return [];
+      /* fall through */
     }
+    // Fallback: extract from Polymarket tokens array
+    if (Array.isArray(m.tokens) && m.tokens.length) {
+      return m.tokens.map((t) => Number(t.price ?? t.outcome_price ?? 0.5));
+    }
+    return [];
   };
 
   const parseOutcomes = (m) => {
+    // Already an array
+    if (Array.isArray(m.outcomes)) return m.outcomes;
     try {
-      return JSON.parse(m.outcomes || "[]");
+      const parsed = JSON.parse(m.outcomes || "[]");
+      if (Array.isArray(parsed)) return parsed;
     } catch {
-      return [];
+      /* fall through */
     }
+    // Fallback: extract outcome labels from tokens
+    if (Array.isArray(m.tokens) && m.tokens.length) {
+      return m.tokens.map((t) => t.outcome || t.name || "Yes");
+    }
+    return [];
   };
 
   const formatMoney = (v) => {
@@ -2105,7 +2282,7 @@ const getSportsMatch = asyncHandler(async (req, res) => {
 
   const sectionMap = {};
   for (const m of matchMarkets) {
-    const type = m.sportsMarketType || "other";
+    const type = inferMarketType(m);
     if (!sectionMap[type]) sectionMap[type] = [];
     const prices = parseOutcomePrices(m);
     const outcomes = parseOutcomes(m);
@@ -2162,15 +2339,22 @@ const getSportsMatch = asyncHandler(async (req, res) => {
   const { teamA: parsedA, teamB: parsedB } = extractTeamsFromQuestion(
     bestForNames?.question || "",
   );
+
+  // Also try names from the event's teams array (most reliable for display)
+  const evtTeamA = eventTeams?.[0]?.name || null;
+  const evtTeamB = eventTeams?.[1]?.name || null;
+
   const teamOutcomes = parseOutcomes(moneylineMarket);
   const teamPrices = parseOutcomePrices(moneylineMarket);
   const isBinary =
     teamOutcomes.length === 2 &&
     ["yes", "no"].includes((teamOutcomes[0] || "").toLowerCase());
 
-  const teamA = parsedA || (!isBinary ? teamOutcomes[0] : null) || null;
+  const teamA =
+    parsedA || evtTeamA || (!isBinary ? teamOutcomes[0] : null) || null;
   const teamB =
     parsedB ||
+    evtTeamB ||
     (!isBinary ? teamOutcomes[teamOutcomes.length - 1] : null) ||
     null;
 
@@ -2185,7 +2369,12 @@ const getSportsMatch = asyncHandler(async (req, res) => {
     ? null
     : rawImage || null;
 
-  const gameStartTime = moneylineMarket.gameStartTime;
+  const gameStartTime =
+    moneylineMarket.gameStartTime ||
+    moneylineMarket.startDate ||
+    moneylineMarket.start_date_iso ||
+    moneylineMarket.endDate || // endDate is often the market close = match end; better than nothing
+    null;
 
   // Fetch live score first so we can use Sofascore team IDs for logos
   const liveScore = await fetchLiveScore(
@@ -2195,17 +2384,21 @@ const getSportsMatch = asyncHandler(async (req, res) => {
     gameStartTime,
   );
 
-  // Prefer Sofascore logos (faster CDN, no rate limits); fallback to TheSportsDB
+  // Prefer Sofascore logos (faster CDN, no rate limits); then event teams logos; fallback to TheSportsDB
   const sofascoreLogoUrl = (id) =>
     id ? `https://api.sofascore.app/api/v1/team/${id}/image` : null;
 
   const [teamAIcon, teamBIcon] = await Promise.all([
     liveScore?.homeTeamId
       ? Promise.resolve(sofascoreLogoUrl(liveScore.homeTeamId))
-      : fetchTeamBadge(teamA),
+      : eventTeams?.[0]?.logo
+        ? Promise.resolve(eventTeams[0].logo)
+        : fetchTeamBadge(teamA),
     liveScore?.awayTeamId
       ? Promise.resolve(sofascoreLogoUrl(liveScore.awayTeamId))
-      : fetchTeamBadge(teamB),
+      : eventTeams?.[1]?.logo
+        ? Promise.resolve(eventTeams[1].logo)
+        : fetchTeamBadge(teamB),
   ]);
 
   return response.success(res, {
@@ -2219,9 +2412,19 @@ const getSportsMatch = asyncHandler(async (req, res) => {
     priceB,
     gameStartTime,
     liveScore, // { home, away, statusShort, statusLong, elapsed, homeTeamId, awayTeamId } or null
-    league:
-      detectSoccerLeague(moneylineMarket) ||
-      detectSportsLeague(moneylineMarket),
+    league: (() => {
+      const slugPfx = (moneylineMarket?.slug || "").split("-")[0].toLowerCase();
+      // Cricket: return IPL or generic Cricket label
+      if (NON_SOCCER_SLUG_PREFIXES.has(slugPfx)) {
+        if (slugPfx === "cricipl" || slugPfx === "ipl") return "IPL";
+        if (slugPfx.startsWith("cri")) return "Cricket";
+        return null; // other non-soccer (baseball, esports, etc.) – no league label
+      }
+      return (
+        detectSoccerLeague(moneylineMarket) ||
+        detectSportsLeague(moneylineMarket)
+      );
+    })(),
     groups,
   });
 });
