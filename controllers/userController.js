@@ -106,6 +106,17 @@ const getPositions = asyncHandler(async (req, res) => {
   // Add current value to each position
   const positionsWithValue = positions.map((pos) => {
     if (pos.marketId) {
+      // Settled bets: use actual payout from settlement, not live LMSR price
+      if (pos.settled) {
+        const payout = pos.payout ?? 0;
+        return {
+          ...pos,
+          currentPrice: pos.won ? 1 : 0,
+          currentValue: payout,
+          unrealizedPnL: payout - (pos.amountSpent || 0),
+        };
+      }
+
       const prices = getPrices(pos.marketId);
       const currentPrice = prices.outcomePrices?.[pos.outcome] ?? 0;
 

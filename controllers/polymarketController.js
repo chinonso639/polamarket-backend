@@ -2255,6 +2255,13 @@ const getSportsMatch = asyncHandler(async (req, res) => {
       if (beatMatch) {
         // Strip any trailing fluff like "to win" from teamB
         const teamB = beatMatch[2].replace(/\s+to\s+win\b.*/i, "").trim();
+        // Reject if teamB looks like a date phrase ("on 2026-04-05", "on April 5" etc.)
+        if (
+          /^(?:on|at|by|in)\s+\d/i.test(teamB) ||
+          /^\d{4}-\d{2}-\d{2}/.test(teamB)
+        ) {
+          return { teamA: beatMatch[1].trim(), teamB: null };
+        }
         return { teamA: beatMatch[1].trim(), teamB };
       }
 
