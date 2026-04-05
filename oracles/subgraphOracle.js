@@ -336,26 +336,57 @@ async function checkGammaResolution(gammaMarketId) {
     const isResolved =
       market.resolved === true ||
       market.closed === true ||
-      market.archived === true;
+      market.archived === true ||
+      market.umaResolutionStatus === "resolved";
 
     if (!isResolved) return null;
 
     let outcome = null;
 
+    // Shape 1: plain outcome string
     if (typeof market.outcome === "string") {
       const out = market.outcome.toUpperCase();
-      if (out === "YES" || out === "NO") {
-        outcome = out;
-      }
+      if (out === "YES" || out === "NO") outcome = out;
     }
 
+    // Shape 2: tokens array with winner flag
     if (!outcome && Array.isArray(market.tokens)) {
       const winnerToken = market.tokens.find((t) => t.winner === true);
       const tokenOutcome = winnerToken?.outcome;
       if (typeof tokenOutcome === "string") {
         const out = tokenOutcome.toUpperCase();
-        if (out === "YES" || out === "NO") {
-          outcome = out;
+        if (out === "YES" || out === "NO") outcome = out;
+      }
+    }
+
+    // Shape 3: outcomePrices array — ["0","1"] or ["1","0"]
+    // paired with outcomes array — ["Yes","No"]
+    if (!outcome) {
+      let prices = market.outcomePrices;
+      let labels = market.outcomes;
+
+      if (typeof prices === "string") {
+        try {
+          prices = JSON.parse(prices);
+        } catch {
+          prices = null;
+        }
+      }
+      if (typeof labels === "string") {
+        try {
+          labels = JSON.parse(labels);
+        } catch {
+          labels = null;
+        }
+      }
+
+      if (Array.isArray(prices) && Array.isArray(labels)) {
+        const winnerIdx = prices.findIndex(
+          (p) => parseFloat(p) === 1 || parseFloat(p) >= 0.99,
+        );
+        if (winnerIdx !== -1 && labels[winnerIdx]) {
+          const out = String(labels[winnerIdx]).toUpperCase();
+          if (out === "YES" || out === "NO") outcome = out;
         }
       }
     }

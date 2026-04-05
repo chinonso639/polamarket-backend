@@ -334,6 +334,31 @@ const fetchLiveScore = async (slugPrefix, teamA, teamB, gameStartTimestamp) => {
 };
 
 /**
+ * Maps frontend nav label (lowercase) to internal category value stored on markets.
+ * Handles case differences and conceptual label differences.
+ */
+const FRONTEND_LABEL_TO_CATEGORY = {
+  politics: "politics",
+  elections: "politics",
+  sports: "sports",
+  crypto: "crypto",
+  esports: "entertainment",
+  culture: "entertainment",
+  entertainment: "entertainment",
+  finance: "business",
+  business: "business",
+  geopolitics: "world",
+  iran: "world",
+  world: "world",
+  tech: "science",
+  weather: "science",
+  science: "science",
+  economy: "other",
+  mentions: "other",
+  other: "other",
+};
+
+/**
  * Known primary category tags from Gamma (case-insensitive matching)
  */
 const CATEGORY_TAG_MAP = {
@@ -1036,14 +1061,18 @@ const parseTeamsFromQuestion = (question = "") => {
     /([\p{L}\p{N} .'-]{2,})\s+vs\.?\s+([\p{L}\p{N} .'-]{2,})/iu,
   );
   if (vsMatch) {
+    // Strip any league/competition prefix leaking into teamA
+    // e.g. "K League 1 - Daejeon Citizen" → "Daejeon Citizen"
+    let teamA = vsMatch[1].trim();
+    teamA = teamA.replace(/^[\p{L}\p{N} .']+\s*[-–]\s*/u, "").trim() || teamA;
     return {
-      teamA: vsMatch[1].trim(),
+      teamA,
       teamB: vsMatch[2].trim(),
     };
   }
 
   const beatMatch = trimmed.match(
-    /will\s+([\p{L}\p{N} .'-]{2,})\s+(beat|defeat|win against)\s+([\p{L}\p{N} .'-]{2,})/iu,
+    /will\s+([\p{L}\p{N} .'-]{2,})\s+(beat|defeat|win against|win over|to beat)\s+([\p{L}\p{N} .'-]{2,})/iu,
   );
   if (beatMatch) {
     return {
@@ -1200,33 +1229,81 @@ const parseMatchFromMarket = (market) => {
  * Fetch live sports-style matches from Gamma and normalize to matchup data
  */
 const getLiveSportsMatches = asyncHandler(async (req, res) => {
-  const limit = parseInt(req.query.limit) || 30;
+  const limit = parseInt(req.query.limit) || 500;
+  // page=1 → fast load (events only, 1 Gamma call)
+  // page=2 → full sweep (events + tagged + 8 broad pages)
+  const page = parseInt(req.query.page) || 1;
 
-  // Pull multiple batches to avoid one-league bias and improve category coverage
-  const batchSize = 200;
-  const batches = 6;
-  let allMarkets = [];
+  const leagueSlugs = Object.keys(SOCCER_SLUG_PREFIX_MAP);
 
-  for (let i = 0; i < batches; i++) {
-    try {
-      const response_data = await gammaApi.get("/markets", {
+  // Build request list based on page number
+  const requests = [
+    // Always include /events — best source for grouped match data
+    gammaApi.get("/events", {
+      params: {
+        limit: 500,
+        active: true,
+        closed: false,
+        order: "volume",
+        ascending: false,
+      },
+    }),
+  ];
+
+  if (page >= 2) {
+    // Full sweep: tagged + 8 broad volume-ordered pages
+    requests.push(
+      gammaApi.get("/markets", {
         params: {
-          limit: batchSize,
-          offset: i * batchSize,
+          limit: 500,
+          tag_slug: leagueSlugs.slice(0, 30).join(","),
           active: true,
           closed: false,
-          order: "volume",
-          ascending: false,
         },
-      });
+      }),
+      ...Array.from({ length: 8 }, (_, i) =>
+        gammaApi.get("/markets", {
+          params: {
+            limit: 500,
+            offset: i * 500,
+            active: true,
+            closed: false,
+            order: "volume",
+            ascending: false,
+          },
+        }),
+      ),
+    );
+  }
 
-      const batch = Array.isArray(response_data.data)
-        ? response_data.data
-        : response_data.data.markets || response_data.data.data || [];
+  const allResults = await Promise.allSettled(requests);
 
-      allMarkets = [...allMarkets, ...batch];
-    } catch (error) {
-      logger.warn(`Failed sports batch ${i}: ${error.message}`);
+  let allMarkets = [];
+  for (let ri = 0; ri < allResults.length; ri++) {
+    const result = allResults[ri];
+    if (result.status !== "fulfilled") {
+      logger.warn(`Sports fetch ${ri} failed: ${result.reason?.message}`);
+      continue;
+    }
+    const data = result.value.data;
+    // Detect events response by presence of events array
+    const events = Array.isArray(data) ? null : data?.events || null;
+    if (events) {
+      for (const event of events) {
+        const eventMarkets = Array.isArray(event.markets) ? event.markets : [];
+        const eventTags = Array.isArray(event.tags) ? event.tags : [];
+        const active = eventMarkets.filter(
+          (m) => !m.closed && m.active !== false,
+        );
+        for (const m of active) {
+          allMarkets.push({ ...m, tags: [...eventTags, ...(m.tags || [])] });
+        }
+      }
+    } else {
+      const batch = Array.isArray(data)
+        ? data
+        : data?.markets || data?.data || [];
+      allMarkets = allMarkets.concat(batch);
     }
   }
 
@@ -1405,7 +1482,12 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
 
   // Filter by category if specified (skip for special filters)
   if (category && category !== "All" && !specialFilters.includes(category)) {
-    transformed = transformed.filter((m) => m.category === category);
+    const internalCategory =
+      FRONTEND_LABEL_TO_CATEGORY[category.toLowerCase()] ||
+      category.toLowerCase();
+    transformed = transformed.filter(
+      (m) => (m.category || "").toLowerCase() === internalCategory,
+    );
   }
 
   // Sort based on filter type
@@ -1802,36 +1884,115 @@ const getSportsMatch = asyncHandler(async (req, res) => {
     return response.error(res, "slugPrefix query param is required", 400);
   }
 
-  // Fetch multiple batches to find all markets sharing this slug prefix
-  const batchSize = 200;
-  const batches = 8;
-  let allMarkets = [];
-
-  for (let i = 0; i < batches; i++) {
-    try {
-      const result = await gammaApi.get("/markets", {
+  // Fetch markets for this match using the same multi-source approach as getLiveSportsMatches.
+  // The /events endpoint is the most reliable source for low-volume leagues (K League etc.)
+  // because it groups markets by event regardless of global volume rank.
+  const allResults = await Promise.allSettled([
+    // /events endpoint — active: catches upcoming/live matches in all leagues
+    gammaApi.get("/events", {
+      params: {
+        limit: 500,
+        active: true,
+        closed: false,
+        order: "volume",
+        ascending: false,
+      },
+    }),
+    // /events endpoint — closed: catches recently finished matches
+    gammaApi.get("/events", {
+      params: {
+        limit: 500,
+        active: false,
+        closed: true,
+        order: "volume",
+        ascending: false,
+      },
+    }),
+    // Broad fallback — active markets by volume, 4 pages × 500
+    ...Array.from({ length: 4 }, (_, i) =>
+      gammaApi.get("/markets", {
         params: {
-          limit: batchSize,
-          offset: i * batchSize,
-          active: true,
-          closed: false,
+          limit: 500,
+          offset: i * 500,
           order: "volume",
           ascending: false,
+          active: true,
+          closed: false,
         },
-      });
-      const batch = Array.isArray(result.data)
-        ? result.data
-        : result.data?.markets || result.data?.data || [];
-      allMarkets = [...allMarkets, ...batch];
-    } catch (_e) {
-      // continue
+      }),
+    ),
+    // Broad fallback — closed markets by volume, 2 pages × 500
+    ...Array.from({ length: 2 }, (_, i) =>
+      gammaApi.get("/markets", {
+        params: {
+          limit: 500,
+          offset: i * 500,
+          order: "volume",
+          ascending: false,
+          active: false,
+          closed: true,
+        },
+      }),
+    ),
+  ]);
+
+  let allMarkets = [];
+  for (const result of allResults) {
+    if (result.status !== "fulfilled") continue;
+    const data = result.value.data;
+    // Events response: { events: [ { markets: [...], tags: [...] } ] }
+    const events = Array.isArray(data) ? null : data?.events || null;
+    if (events) {
+      for (const event of events) {
+        const eventMarkets = Array.isArray(event.markets) ? event.markets : [];
+        const eventTags = Array.isArray(event.tags) ? event.tags : [];
+        for (const m of eventMarkets) {
+          allMarkets.push({ ...m, tags: [...eventTags, ...(m.tags || [])] });
+        }
+      }
+    } else {
+      // Plain markets response
+      const batch = Array.isArray(data)
+        ? data
+        : data?.markets || data?.data || [];
+      allMarkets = allMarkets.concat(batch);
     }
   }
 
-  // Filter to this match's slug prefix
-  const matchMarkets = allMarkets.filter(
-    (m) => m.slug && m.slug.startsWith(slugPrefix),
-  );
+  // Filter to this match's slug prefix (deduplicate first)
+  const seenIds = new Set();
+  let matchMarkets = allMarkets.filter((m) => {
+    const id = m.id || m.condition_id || m.conditionId;
+    if (!id || seenIds.has(id)) return false;
+    seenIds.add(id);
+    return m.slug && m.slug.startsWith(slugPrefix);
+  });
+
+  if (matchMarkets.length === 0) {
+    // Last-resort: try Gamma search endpoint by the slug prefix itself
+    try {
+      const searchResult = await gammaApi.get("/markets", {
+        params: {
+          limit: 50,
+          // Some Gamma deployments support a 'slug_contains' or 'slug' search param
+          slug: slugPrefix,
+          active: true,
+          closed: false,
+        },
+      });
+      const searchBatch = Array.isArray(searchResult.data)
+        ? searchResult.data
+        : searchResult.data?.markets || searchResult.data?.data || [];
+      const extra = searchBatch.filter(
+        (m) => m.slug && m.slug.startsWith(slugPrefix),
+      );
+      if (extra.length > 0) {
+        matchMarkets.push(...extra);
+      }
+    } catch (_e) {
+      // ignore
+    }
+  }
 
   if (matchMarkets.length === 0) {
     return response.success(res, { slugPrefix, groups: [] });
@@ -1844,14 +2005,50 @@ const getSportsMatch = asyncHandler(async (req, res) => {
 
   // Best team names: try to parse from "Team A vs Team B" in the question
   const extractTeamsFromQuestion = (question = "") => {
+    // Remove leading "Will ", trailing "?" and everything after
     const cleaned = question
       .replace(/^Will\s+/i, "")
       .replace(/\?.*$/, "")
       .trim();
-    const vsMatch = cleaned.match(/^(.+?)\s+vs\.?\s+(.+?)(\s*(?:end|:)|$)/i);
-    if (vsMatch) {
-      return { teamA: vsMatch[1].trim(), teamB: vsMatch[2].trim() };
+
+    // Strip common league/competition prefix patterns like:
+    //   "K League 1 - Daejeon vs Daegu"  →  "Daejeon vs Daegu"
+    //   "Premier League: Arsenal vs Chelsea"  →  "Arsenal vs Chelsea"
+    const stripped = cleaned
+      .replace(/^[A-Za-z0-9 .']+\s*-\s*/, "") // "League Name - "
+      .replace(/^[A-Za-z0-9 .']+:\s*/, "") // "League Name: "
+      .trim();
+
+    // 1. Try "vs" pattern on stripped text first
+    const vsStripped = stripped.match(
+      /^(.+?)\s+vs\.?\s+(.+?)(?:\s*[:–-].*)?$/i,
+    );
+    if (vsStripped) {
+      return { teamA: vsStripped[1].trim(), teamB: vsStripped[2].trim() };
     }
+
+    // 2. Try "vs" pattern on full cleaned text, then strip any league prefix from teamA
+    const vsFull = cleaned.match(/(.+?)\s+vs\.?\s+(.+?)(?:\s*[:–-].*)?$/i);
+    if (vsFull) {
+      let teamA = vsFull[1].trim();
+      // Strip "League Name - " or "League Name: " prefix from teamA
+      teamA = teamA
+        .replace(/^[A-Za-z0-9 .']+\s*-\s*/, "")
+        .replace(/^[A-Za-z0-9 .']+:\s*/, "")
+        .trim();
+      return { teamA, teamB: vsFull[2].trim() };
+    }
+
+    // 3. Handle "Will TeamA beat/defeat/win against TeamB" (binary Yes/No markets)
+    const beatMatch = cleaned.match(
+      /^(.+?)\s+(?:beat|defeat|win(?:s)?(?:\s+against)?|to\s+beat)\s+(.+)/i,
+    );
+    if (beatMatch) {
+      // Strip any trailing fluff like "to win" from teamB
+      const teamB = beatMatch[2].replace(/\s+to\s+win\b.*/i, "").trim();
+      return { teamA: beatMatch[1].trim(), teamB };
+    }
+
     return { teamA: null, teamB: null };
   };
 
