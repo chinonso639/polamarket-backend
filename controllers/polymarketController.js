@@ -2005,16 +2005,24 @@ const getSportsMatch = asyncHandler(async (req, res) => {
   ]);
 
   let allMarkets = [];
-  let eventTeams = null; // teams array from the event object (has direct logo URLs)
+  let eventTeams = null; // teams array from the correct event (matching slugPrefix)
 
   // Expand an item that may be an event wrapper (has .markets[]) or a plain market
   const expandItem = (item, extraTags = []) => {
     if (Array.isArray(item.markets) && item.markets.length > 0) {
-      // It's an event object — pull teams for logos and expand nested markets
-      if (!eventTeams && Array.isArray(item.teams) && item.teams.length > 0) {
+      // It's an event object — only capture teams if this event contains our slugPrefix
+      const evtTags = Array.isArray(item.tags) ? item.tags : [];
+      const isOurEvent = item.markets.some(
+        (m) => m.slug && m.slug.startsWith(slugPrefix),
+      );
+      if (
+        isOurEvent &&
+        !eventTeams &&
+        Array.isArray(item.teams) &&
+        item.teams.length > 0
+      ) {
         eventTeams = item.teams;
       }
-      const evtTags = Array.isArray(item.tags) ? item.tags : [];
       for (const m of item.markets) {
         allMarkets.push({
           ...m,
@@ -2388,16 +2396,25 @@ const getSportsMatch = asyncHandler(async (req, res) => {
   const sofascoreLogoUrl = (id) =>
     id ? `https://api.sofascore.app/api/v1/team/${id}/image` : null;
 
+  // Match eventTeams entries to teamA/teamB by name (case-insensitive) so order doesn't matter
+  const findEvtLogo = (name) => {
+    if (!eventTeams || !name) return null;
+    const found = eventTeams.find(
+      (t) => t.name && t.name.toLowerCase() === name.toLowerCase(),
+    );
+    return found?.logo || null;
+  };
+
   const [teamAIcon, teamBIcon] = await Promise.all([
     liveScore?.homeTeamId
       ? Promise.resolve(sofascoreLogoUrl(liveScore.homeTeamId))
-      : eventTeams?.[0]?.logo
-        ? Promise.resolve(eventTeams[0].logo)
+      : findEvtLogo(teamA)
+        ? Promise.resolve(findEvtLogo(teamA))
         : fetchTeamBadge(teamA),
     liveScore?.awayTeamId
       ? Promise.resolve(sofascoreLogoUrl(liveScore.awayTeamId))
-      : eventTeams?.[1]?.logo
-        ? Promise.resolve(eventTeams[1].logo)
+      : findEvtLogo(teamB)
+        ? Promise.resolve(findEvtLogo(teamB))
         : fetchTeamBadge(teamB),
   ]);
 
