@@ -84,8 +84,22 @@ async function fetchMarketEvents(conditionId) {
  * @returns {Object} - Internal market format
  */
 function transformMarket(gammaMarket) {
-  // Extract probabilities if available
-  const outcomes = gammaMarket.outcomes || [];
+  // Gamma API returns outcomes as a stringified JSON array in some responses
+  let rawOutcomes = gammaMarket.outcomes || [];
+  if (typeof rawOutcomes === "string") {
+    try {
+      rawOutcomes = JSON.parse(rawOutcomes);
+    } catch {
+      rawOutcomes = [];
+    }
+  }
+  if (!Array.isArray(rawOutcomes)) rawOutcomes = [];
+
+  // Normalise: Gamma sometimes returns plain strings ["Yes","No"] instead of objects
+  const outcomes = rawOutcomes.map((o) =>
+    typeof o === "string" ? { name: o, outcome: o, price: 0.5 } : o,
+  );
+
   const yesOutcome = outcomes.find(
     (o) => o.name === "Yes" || o.outcome === "Yes",
   );

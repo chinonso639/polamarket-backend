@@ -9,6 +9,7 @@ const Transaction = require("../models/Transaction");
 const response = require("../utils/response");
 const logger = require("../utils/logger");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { getGammaCached, setGammaCached } = require("../utils/gammaCache");
 
 const GAMMA_API_URL =
   process.env.GAMMA_API_URL || "https://gamma-api.polymarket.com";
@@ -1264,6 +1265,14 @@ const getMarkets = asyncHandler(async (req, res) => {
     order = "volume",
   } = req.query;
 
+  const marketsCacheKey = `gamma:markets:${parseInt(offset)}`;
+  const cachedMarkets = await getGammaCached(marketsCacheKey);
+  if (cachedMarkets) {
+    const transformed = cachedMarkets.map(transformMarket);
+    const enriched = await attachLocalOutcomeStats(transformed);
+    return response.success(res, enriched);
+  }
+
   const response_data = await gammaApi.get("/markets", {
     params: {
       limit: parseInt(limit),
@@ -1279,6 +1288,7 @@ const getMarkets = asyncHandler(async (req, res) => {
     ? response_data.data
     : response_data.data.markets || response_data.data.data || [];
 
+  await setGammaCached(marketsCacheKey, markets, 60);
   const transformed = markets.map(transformMarket);
   const enriched = await attachLocalOutcomeStats(transformed);
 
@@ -1295,53 +1305,56 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
 
   // Use events endpoint - has real volume data vs fake/low-volume sports markets
   let allMarkets = [];
+  const cachedRaw = await getGammaCached("gamma:trending:raw");
+  if (cachedRaw) allMarkets = cachedRaw;
   const now = new Date();
 
   // Rotation factor - changes every 10 minutes to show different markets
   // This ensures users see variety even with the same top volume markets
   const rotationIndex = Math.floor(Date.now() / (10 * 60 * 1000)) % 15;
 
-  try {
-    // Fetch more events to get variety across categories
-    const eventsResponse = await gammaApi.get("/events", {
-      params: {
-        limit: 200,
-        order: "volume",
-        ascending: false,
-        active: true,
-        closed: false,
-      },
-    });
+  if (!cachedRaw)
+    try {
+      // Fetch more events to get variety across categories
+      const eventsResponse = await gammaApi.get("/events", {
+        params: {
+          limit: 200,
+          order: "volume",
+          ascending: false,
+          active: true,
+          closed: false,
+        },
+      });
 
-    const events = Array.isArray(eventsResponse.data)
-      ? eventsResponse.data
-      : eventsResponse.data.events || [];
+      const events = Array.isArray(eventsResponse.data)
+        ? eventsResponse.data
+        : eventsResponse.data.events || [];
 
-    // Extract all active markets from events, inheriting event tags and sibling count
-    for (const event of events) {
-      const eventMarkets = Array.isArray(event.markets) ? event.markets : [];
-      const eventTags = Array.isArray(event.tags) ? event.tags : [];
-      const activeEventMarkets = eventMarkets.filter(
-        (m) => !m.closed && m.active !== false,
-      );
-      const siblingCount = activeEventMarkets.length;
-      const marketsWithMeta = activeEventMarkets.map((m) => ({
-        ...m,
-        // Merge event tags with any market-specific tags
-        tags: [...eventTags, ...(m.tags || [])],
-        // Track how many sibling markets exist in the same event
-        siblingCount,
-        // Pass eventId so detail page can fetch siblings directly
-        eventId: event.id,
-      }));
-      allMarkets = [...allMarkets, ...marketsWithMeta];
+      // Extract all active markets from events, inheriting event tags and sibling count
+      for (const event of events) {
+        const eventMarkets = Array.isArray(event.markets) ? event.markets : [];
+        const eventTags = Array.isArray(event.tags) ? event.tags : [];
+        const activeEventMarkets = eventMarkets.filter(
+          (m) => !m.closed && m.active !== false,
+        );
+        const siblingCount = activeEventMarkets.length;
+        const marketsWithMeta = activeEventMarkets.map((m) => ({
+          ...m,
+          // Merge event tags with any market-specific tags
+          tags: [...eventTags, ...(m.tags || [])],
+          // Track how many sibling markets exist in the same event
+          siblingCount,
+          // Pass eventId so detail page can fetch siblings directly
+          eventId: event.id,
+        }));
+        allMarkets = [...allMarkets, ...marketsWithMeta];
+      }
+    } catch (error) {
+      logger.warn(`Failed to fetch events: ${error.message}`);
     }
-  } catch (error) {
-    logger.warn(`Failed to fetch events: ${error.message}`);
-  }
 
   // Fallback: also fetch some from markets endpoint if needed
-  if (allMarkets.length < 50) {
+  if (!cachedRaw && allMarkets.length < 50) {
     try {
       const marketsResponse = await gammaApi.get("/markets", {
         params: {
@@ -1373,6 +1386,7 @@ const getTrendingMarkets = asyncHandler(async (req, res) => {
     seen.add(id);
     return true;
   });
+  if (!cachedRaw) await setGammaCached("gamma:trending:raw", allMarkets, 60);
 
   let transformed = allMarkets.map(transformMarket);
 
@@ -2026,17 +2040,21 @@ const searchMarkets = asyncHandler(async (req, res) => {
     return response.success(res, []);
   }
 
-  const response_data = await gammaApi.get("/markets", {
-    params: {
-      limit: 100,
-      active: true,
-      closed: false,
-    },
-  });
-
-  const markets = Array.isArray(response_data.data)
-    ? response_data.data
-    : response_data.data.markets || response_data.data.data || [];
+  const searchRawKey = "gamma:search:raw";
+  let markets = await getGammaCached(searchRawKey);
+  if (!markets) {
+    const response_data = await gammaApi.get("/markets", {
+      params: {
+        limit: 100,
+        active: true,
+        closed: false,
+      },
+    });
+    markets = Array.isArray(response_data.data)
+      ? response_data.data
+      : response_data.data.markets || response_data.data.data || [];
+    await setGammaCached(searchRawKey, markets, 30);
+  }
 
   // Filter by search query
   const filtered = markets.filter(
@@ -2057,6 +2075,10 @@ const searchMarkets = asyncHandler(async (req, res) => {
  * Get categories with counts from full market dataset
  */
 const getCategories = asyncHandler(async (req, res) => {
+  // Serve from cache if available (pre-warmed by 30s sync job)
+  const cachedCategories = await getGammaCached("gamma:categories");
+  if (cachedCategories) return response.success(res, cachedCategories);
+
   // Fetch multiple batches for accurate counts
   const batchSize = 100;
   const batches = 3;
@@ -2104,6 +2126,7 @@ const getCategories = asyncHandler(async (req, res) => {
     .map(([name, count]) => ({ name, count }))
     .sort((a, b) => b.count - a.count);
 
+  await setGammaCached("gamma:categories", categories, 60);
   return response.success(res, categories);
 });
 
